@@ -39,6 +39,10 @@ npx wrangler deploy
 
 ## Setting Secrets (wajib!)
 
+Dapetin token Freebuff di **https://freebuff.llm.pm/** — login trus generate token disana.
+
+Token bisa berisi satu akun atau multi akun (dipisah koma) untuk concurrent request.
+
 Ada 2 secrets yang harus diset sebelum worker bisa dipakai:
 
 ```bash
