@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "freebuff2apiworker",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-12-18",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "FREEBUFF_TOKEN": "71087b74-6c4e-4da0-8a14-0609f57d4266,dff4a202-8449-4570-9096-adb4195a2980",
+    "FREEBUFF_API_KEY": "sk-123",
+    "FREEBUFF_AD_PROVIDERS": "gravity,zeroclick",
+    "FREEBUFF_TIMEOUT": "60",
+    "FREEBUFF_DEBUG": "true",
+    "FREEBUFF_TIMEZONE": "Asia/Shanghai",
+    "FREEBUFF_LOCALE": "zh-CN",
+    "FREEBUFF_OS": "windows",
+    "FREEBUFF_BROWSER_UA": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "CODEBUFF_API_URL": "https://www.codebuff.com",
+    "CLIENT_ID": "freebuff-cli-worker"
+  }
+}
