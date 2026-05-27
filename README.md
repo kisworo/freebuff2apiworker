@@ -39,7 +39,7 @@ npx wrangler deploy
 
 ## Setting Secrets (wajib!)
 
-Dapetin token Freebuff di **https://freebuff.llm.pm/** — login trus generate token disana.
+Dapetin token Freebuff di **https://freebuff.071129.xyz/** — login trus generate token disana.
 
 Token bisa berisi satu akun atau multi akun (dipisah koma) untuk concurrent request.
 
