@@ -7,8 +7,6 @@
     "enabled": true
   },
   "vars": {
-    "FREEBUFF_TOKEN": "71087b74-6c4e-4da0-8a14-0609f57d4266,dff4a202-8449-4570-9096-adb4195a2980",
-    "FREEBUFF_API_KEY": "sk-123",
     "FREEBUFF_AD_PROVIDERS": "gravity,zeroclick",
     "FREEBUFF_TIMEOUT": "60",
     "FREEBUFF_DEBUG": "true",

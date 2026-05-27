@@ -2,4 +2,5 @@ node_modules/
 .wrangler/tmp/
 .wrangler/*.json
 .env
+.dev.vars
 *.log
