@@ -102,8 +102,15 @@ export class CodebuffClient {
     userAgentOverride?: string;
     extra?: Record<string, string>;
   } = {}): Record<string, string> {
+    let hostVal = "www.codebuff.com";
+    try {
+      hostVal = new URL(this.api_url).host;
+    } catch {}
     const headers: Record<string, string> = {
       Accept: "*/*",
+      "Accept-Encoding": "gzip, deflate",
+      Connection: "keep-alive",
+      Host: hostVal,
       "User-Agent": userAgentOverride || this.user_agent,
     };
     if (requireAuth) {
@@ -368,6 +375,7 @@ export class CodebuffClient {
     if (this.env.FREEBUFF_DEBUG === "true") {
       console.log("[Upstream Stream Request]", {
         url,
+        headers: { ...reqHeaders, Authorization: reqHeaders.Authorization ? "Bearer [REDACTED]" : undefined },
         body: payload,
       });
     }

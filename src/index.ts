@@ -3,6 +3,19 @@ import { resolveModel, modelsResponse } from "./models";
 import { CodebuffAccountPool, utcNowIso, FreebuffRun, CodebuffClient } from "./codebuff";
 import { buildUpstreamPayload, sanitizeStreamChunk, CompletionAccumulator } from "./openai_compat";
 
+function runInBackground(c: any, fn: () => Promise<any>) {
+  try {
+    const ctx = c.executionCtx;
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(fn());
+      return;
+    }
+  } catch (err) {
+    // Ignore "This context has no ExecutionContext" error
+  }
+  fn().catch(err => console.error("[Worker] Background task failed", err));
+}
+
 const app = new Hono<{ Bindings: Record<string, string> }>();
 
 let pool: CodebuffAccountPool | null = null;
@@ -72,46 +85,44 @@ app.post("/v1/chat/completions", async (c) => {
       const writer = writable.getWriter();
       
       const activeLease = lease;
-      c.executionCtx.waitUntil(
-        (async () => {
-          let messageId: string | null = null;
-          const reader = responseStream.body!.getReader();
-          const encoder = new TextEncoder();
-          try {
-            for await (const line of getLines(reader)) {
-              const data = decodeSseData(line);
-              if (data === null) continue;
-              if (data === "[DONE]") {
-                await writer.write(encoder.encode("data: [DONE]\n\n"));
-                break;
-              }
-              if (data.id) {
-                messageId = data.id;
-              }
-              const chunk = sanitizeStreamChunk(data);
-              if (chunk !== null) {
-                await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-              }
+      runInBackground(c, async () => {
+        let messageId: string | null = null;
+        const reader = responseStream.body!.getReader();
+        const encoder = new TextEncoder();
+        try {
+          for await (const line of getLines(reader)) {
+            const data = decodeSseData(line);
+            if (data === null) continue;
+            if (data === "[DONE]") {
+              await writer.write(encoder.encode("data: [DONE]\n\n"));
+              break;
             }
-          } catch (err: any) {
-            console.error("[Worker] Error in stream forwarding", err);
-            const errChunk = {
-              error: {
-                message: err.message || String(err),
-                type: "upstream_error",
-                code: "codebuff_error",
-              }
-            };
-            await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
-            await writer.write(encoder.encode("data: [DONE]\n\n"));
-          } finally {
-            await writer.close();
-            // Finalize run and release token lease in background
-            await finalizeRun(client, run, messageId);
-            await activeLease.release();
+            if (data.id) {
+              messageId = data.id;
+            }
+            const chunk = sanitizeStreamChunk(data);
+            if (chunk !== null) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            }
           }
-        })()
-      );
+        } catch (err: any) {
+          console.error("[Worker] Error in stream forwarding", err);
+          const errChunk = {
+            error: {
+              message: err.message || String(err),
+              type: "upstream_error",
+              code: "codebuff_error",
+            }
+          };
+          await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+        } finally {
+          await writer.close();
+          // Finalize run and release token lease in background
+          await finalizeRun(client, run, messageId);
+          await activeLease.release();
+        }
+      });
 
       return new Response(readable, {
         headers: {
@@ -140,10 +151,10 @@ app.post("/v1/chat/completions", async (c) => {
         return c.json(finalObj);
       } finally {
         const activeLease = lease;
-        c.executionCtx.waitUntil((async () => {
+        runInBackground(c, async () => {
           await finalizeRun(client, run, messageId);
           await activeLease.release();
-        })());
+        });
       }
     }
   } catch (err: any) {

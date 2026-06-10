@@ -12,6 +12,7 @@ export const FREEBUFF_MODELS: FreebuffModel[] = [
   { id: "deepseek/deepseek-v4-pro", agent_id: "base2-free-deepseek", owned_by: "freebuff" },
   { id: "moonshotai/kimi-k2.6", agent_id: "base2-free-kimi", owned_by: "freebuff" },
   { id: "minimax/minimax-m2.7", agent_id: "base2-free", owned_by: "freebuff" },
+  { id: "mimo/mimo-v2.5", agent_id: "base2-free-mimo", owned_by: "mimo" },
 ];
 
 export const CONTEXT_PRUNER_AGENT_ID = "context-pruner";
