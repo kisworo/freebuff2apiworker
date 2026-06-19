@@ -1,4 +1,4 @@
-import { agentValidationPayload } from "./models";
+import { agentValidationPayload, ALL_MODELS, getSessionId } from "./models";
 
 export class CodebuffError extends Error {
   public status_code: number;
@@ -152,11 +152,15 @@ export class CodebuffClient {
     }
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
       const response = await fetch(url, {
         method,
         headers: reqHeaders,
         body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
 
       if (this.env.FREEBUFF_DEBUG === "true") {
         console.log(`[Upstream Response] status=${response.status}`);
@@ -380,11 +384,15 @@ export class CodebuffClient {
       });
     }
 
+    const streamController = new AbortController();
+    const streamTimeoutId = setTimeout(() => streamController.abort(), 120000);
     const response = await fetch(url, {
       method: "POST",
       headers: reqHeaders,
       body: JSON.stringify(payload),
+      signal: streamController.signal,
     });
+    clearTimeout(streamTimeoutId);
 
     if (response.status >= 400) {
       const text = await response.text();
@@ -447,6 +455,17 @@ export class SessionManager {
 
     try {
       const session = await this.client.createSession(model);
+      // Validate the new session matches the requested model
+      const check = await this.client.getSession(session.instance_id);
+      if (check.status === "active" && check.model && check.model !== model) {
+        console.log(`[Codebuff] New session model mismatch after create: got=${check.model} want=${model}, retrying...`);
+        await this.client.deleteSession();
+        await delay(500);
+        const retrySession = await this.client.createSession(model);
+        this.sessions.set(model, retrySession);
+        console.log(`[Codebuff] Created session (retry) model=${model} instance_id=${retrySession.instance_id}`);
+        return retrySession;
+      }
       this.sessions.set(model, session);
       console.log(`[Codebuff] Created session model=${model} instance_id=${session.instance_id} remaining_ms=${session.remaining_ms}`);
       return session;
@@ -457,6 +476,7 @@ export class SessionManager {
       console.log(`[Codebuff] Session locked during create; delete and retry model=${model}`);
       await this.client.deleteSession();
       this.sessions.clear();
+      await delay(500);
       await this.client.requestAdChain(messages);
       const session = await this.client.createSession(model);
       this.sessions.set(model, session);
@@ -514,10 +534,14 @@ export interface CodebuffAccountLease {
   release: () => Promise<void>;
 }
 
+const LEASE_TIMEOUT_MS = 90000; // 90s max before force-releasing a stuck lease
+
 export class CodebuffAccountPool {
   private accounts: CodebuffAccount[] = [];
   private nextIndex = 0;
   private waitingQueue: ((idx: number) => void)[] = [];
+  private modelToAccount = new Map<string, number>();
+  private leaseTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
   constructor(env: CodebuffEnv) {
     const rawTokens = env.FREEBUFF_TOKEN || "";
@@ -532,16 +556,48 @@ export class CodebuffAccountPool {
         busy: false,
       });
     }
+
+    // Pre-assign each unique session model to a dedicated account (sticky)
+    const sessionModels = [...new Set(ALL_MODELS.map(m => getSessionId(m)))];
+    console.log(`[AccountPool] Pre-assigning ${sessionModels.length} session models to ${this.accounts.length} accounts:`);
+    sessionModels.forEach((sm, i) => {
+      const accountIdx = i % this.accounts.length;
+      this.modelToAccount.set(sm, accountIdx);
+      console.log(`  ${sm} → account[${accountIdx}]`);
+    });
   }
 
   public get accountCount(): number {
     return this.accounts.length;
   }
 
-  public async acquireSession(model: string, messages?: any[]): Promise<CodebuffAccountLease> {
-    const accountIndex = await this.reserveAccount();
+  public async acquireSession(model: string, messages?: any[], routingKey?: string): Promise<CodebuffAccountLease> {
+    // Prefer sticky account (same routingKey), but don't hang if it's busy
+    const stickyIdx = routingKey ? this.modelToAccount.get(routingKey) : undefined;
+    let accountIndex: number;
+
+    if (stickyIdx !== undefined && !this.accounts[stickyIdx].busy) {
+      this.accounts[stickyIdx].busy = true;
+      accountIndex = stickyIdx;
+    } else {
+      accountIndex = await this.reserveAccount();
+    }
+
     const account = this.accounts[accountIndex];
     console.log(`[AccountPool] Leased account index=${accountIndex} (token=${account.client.getTokenPrefix()}) for model=${model}`);
+
+    // Watchdog: force-release if lease is held too long (stuck upstream)
+    const watchdogIdx = accountIndex;
+    const timer = setTimeout(() => {
+      console.warn(`[AccountPool] LEASE TIMEOUT after ${LEASE_TIMEOUT_MS}ms — force-releasing account index=${watchdogIdx}`);
+      this.accounts[watchdogIdx].busy = false;
+      this.leaseTimers.delete(watchdogIdx);
+      // Notify next waiter if any
+      const nextWaiter = this.waitingQueue.shift();
+      if (nextWaiter) nextWaiter(watchdogIdx);
+    }, LEASE_TIMEOUT_MS);
+    this.leaseTimers.set(accountIndex, timer);
+
     try {
       const { session, release: releaseSessionLock } = await account.sessions.acquireSession(model, messages);
       let closed = false;
@@ -551,12 +607,17 @@ export class CodebuffAccountPool {
         release: async () => {
           if (closed) return;
           closed = true;
+          // Clear watchdog
+          const t = this.leaseTimers.get(accountIndex);
+          if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
           releaseSessionLock();
           console.log(`[AccountPool] Released account index=${accountIndex} (token=${account.client.getTokenPrefix()})`);
           await this.releaseAccount(accountIndex);
         }
       };
     } catch (err) {
+      const t = this.leaseTimers.get(accountIndex);
+      if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
       await this.releaseAccount(accountIndex);
       throw err;
     }

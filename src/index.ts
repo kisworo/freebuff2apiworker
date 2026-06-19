@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { resolveModel, modelsResponse } from "./models";
+import { resolveModel, modelsResponse, getSessionId } from "./models";
 import { CodebuffAccountPool, utcNowIso, FreebuffRun, CodebuffClient } from "./codebuff";
 import { buildUpstreamPayload, sanitizeStreamChunk, CompletionAccumulator } from "./openai_compat";
 
@@ -61,7 +61,9 @@ app.post("/v1/chat/completions", async (c) => {
 
   try {
     // 1. Acquire session lease from the pool (rotates keys, locks sessions, validation, ads)
-    lease = await accountPool.acquireSession(modelConfig.id, body.messages);
+    // Use session model ID for account routing; actual model ID for session creation
+    const sessionModel = getSessionId(modelConfig);
+    lease = await accountPool.acquireSession(modelConfig.id, body.messages, sessionModel);
     const client = lease.client;
     const session = lease.session;
 
@@ -162,6 +164,7 @@ app.post("/v1/chat/completions", async (c) => {
     if (lease) {
       await lease.release();
     }
+
     return c.json({
       error: {
         message: err.message || String(err),
