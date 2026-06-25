@@ -7,9 +7,9 @@
     "enabled": true
   },
   "vars": {
-    "FREEBUFF_AD_PROVIDERS": "gravity,zeroclick",
-    "FREEBUFF_TIMEOUT": "60",
-    "FREEBUFF_DEBUG": "true",
+    "FREEBUFF_AD_PROVIDERS": ",",
+    "FREEBUFF_TIMEOUT": "30",
+    "FREEBUFF_DEBUG": "false",
     "FREEBUFF_TIMEZONE": "Asia/Shanghai",
     "FREEBUFF_LOCALE": "zh-CN",
     "FREEBUFF_OS": "windows",

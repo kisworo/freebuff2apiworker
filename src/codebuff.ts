@@ -534,7 +534,7 @@ export interface CodebuffAccountLease {
   release: () => Promise<void>;
 }
 
-const LEASE_TIMEOUT_MS = 300000; // 5min — generous for long responses, catches truly stuck requests
+const LEASE_TIMEOUT_MS = 90000; // 90s — was 5min, too long caused cascade deadlock when upstream slow
 
 export class CodebuffAccountPool {
   private accounts: CodebuffAccount[] = [];

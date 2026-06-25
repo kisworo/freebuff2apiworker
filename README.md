@@ -17,7 +17,10 @@ OpenAI-compatible proxy untuk Freebuff / Codebuff API, dijalankan di Cloudflare 
 - `deepseek/deepseek-v4-pro`
 - `moonshotai/kimi-k2.6`
 - `minimax/minimax-m2.7`
+- `minimax/minimax-m3`
 - `mimo/mimo-v2.5`
+- `mimo/mimo-v2.5-pro`
+- `z-ai/glm-5.2`
 
 **Gemini Models (via Freebuff session):**
 - `google/gemini-2.5-flash-lite`
