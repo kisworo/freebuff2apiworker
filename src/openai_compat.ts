@@ -194,9 +194,12 @@ export function sanitizeStreamChunk(chunk: any): any | null {
       delete item.delta.content;
     }
 
-    // Do not forward reasoning_content to clients. Some upstream reasoning
-    // models include internal plans or pseudo-tool text (DSML/web_search)
-    // there, and many clients display it as if it were the answer.
+    if (typeof reasoningContent === "string") {
+      const cleanReasoning = stripInternalToolMarkup(reasoningContent);
+      if (cleanReasoning) {
+        item.delta.reasoning_content = cleanReasoning;
+      }
+    }
 
     clean.choices.push(item);
   }
@@ -296,7 +299,9 @@ export class CompletionAccumulator {
       message.tool_calls = sortedIndexes.map(idx => this.toolCalls[idx]);
     }
 
-    // Do not expose reasoning_content; return only the final assistant content.
+    if (this.reasoningContent) {
+      message.reasoning_content = this.reasoningContent;
+    }
 
     const response: any = {
       id: this.id,
