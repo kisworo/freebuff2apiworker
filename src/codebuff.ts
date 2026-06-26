@@ -1,4 +1,4 @@
-import { agentValidationPayload, ALL_MODELS, getSessionId } from "./models";
+import { agentValidationPayload } from "./models";
 
 export class CodebuffError extends Error {
   public status_code: number;
@@ -385,7 +385,7 @@ export class CodebuffClient {
     }
 
     const streamController = new AbortController();
-    const streamTimeoutId = setTimeout(() => streamController.abort(), 120000);
+    const streamTimeoutId = setTimeout(() => streamController.abort(), 60000);
     const response = await fetch(url, {
       method: "POST",
       headers: reqHeaders,
@@ -534,13 +534,14 @@ export interface CodebuffAccountLease {
   release: () => Promise<void>;
 }
 
-const LEASE_TIMEOUT_MS = 90000; // 90s — was 5min, too long caused cascade deadlock when upstream slow
+const LEASE_TIMEOUT_MS = 60000; // 60s — fail fast when upstream is slow/stuck so clients don't appear hung
 
 export class CodebuffAccountPool {
   private accounts: CodebuffAccount[] = [];
   private nextIndex = 0;
   private waitingQueue: ((idx: number) => void)[] = [];
-  private modelToAccount = new Map<string, number>();
+  private modelToAccounts = new Map<string, number[]>();
+  private nextModelPoolIndex = new Map<string, number>();
   private leaseTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
   constructor(env: CodebuffEnv) {
@@ -557,14 +558,7 @@ export class CodebuffAccountPool {
       });
     }
 
-    // Pre-assign each unique session model to a dedicated account (sticky)
-    const sessionModels = [...new Set(ALL_MODELS.map(m => getSessionId(m)))];
-    console.log(`[AccountPool] Pre-assigning ${sessionModels.length} session models to ${this.accounts.length} accounts:`);
-    sessionModels.forEach((sm, i) => {
-      const accountIdx = i % this.accounts.length;
-      this.modelToAccount.set(sm, accountIdx);
-      console.log(`  ${sm} → account[${accountIdx}]`);
-    });
+    this.assignModelPools();
   }
 
   public get accountCount(): number {
@@ -572,13 +566,21 @@ export class CodebuffAccountPool {
   }
 
   public async acquireSession(model: string, messages?: any[], routingKey?: string): Promise<CodebuffAccountLease> {
-    // Prefer sticky account (same routingKey), but don't hang if it's busy
-    const stickyIdx = routingKey ? this.modelToAccount.get(routingKey) : undefined;
+    // Strict per-model token pools: a model may round-robin only within its
+    // assigned accounts, never borrow from another model's pool. This prevents
+    // Freebuff model_locked cascades while giving hot models more capacity.
+    const modelPool = routingKey ? this.modelToAccounts.get(routingKey) : undefined;
     let accountIndex: number;
 
-    if (stickyIdx !== undefined && !this.accounts[stickyIdx].busy) {
-      this.accounts[stickyIdx].busy = true;
-      accountIndex = stickyIdx;
+    if (modelPool && modelPool.length > 0) {
+      const reserved = this.reserveFromModelPool(routingKey!, modelPool);
+      if (reserved === null) {
+        throw new CodebuffError(
+          `All assigned accounts busy for ${model}; strict model-pool routing prevents switching to another token`,
+          429
+        );
+      }
+      accountIndex = reserved;
     } else {
       accountIndex = await this.reserveAccount();
     }
@@ -590,11 +592,10 @@ export class CodebuffAccountPool {
     const watchdogIdx = accountIndex;
     const timer = setTimeout(() => {
       console.warn(`[AccountPool] LEASE TIMEOUT after ${LEASE_TIMEOUT_MS}ms — force-releasing account index=${watchdogIdx}`);
-      this.accounts[watchdogIdx].busy = false;
       this.leaseTimers.delete(watchdogIdx);
-      // Notify next waiter if any
-      const nextWaiter = this.waitingQueue.shift();
-      if (nextWaiter) nextWaiter(watchdogIdx);
+      this.releaseAccount(watchdogIdx).catch(err => {
+        console.warn(`[AccountPool] Failed to force-release account index=${watchdogIdx}`, err);
+      });
     }, LEASE_TIMEOUT_MS);
     this.leaseTimers.set(accountIndex, timer);
 
@@ -636,9 +637,59 @@ export class CodebuffAccountPool {
     });
   }
 
+  private assignModelPools(): void {
+    const count = this.accounts.length;
+    const assign = (model: string, indexes: number[]) => {
+      const validIndexes = indexes.filter(idx => idx >= 0 && idx < count);
+      if (validIndexes.length === 0) return;
+      this.modelToAccounts.set(model, validIndexes);
+      console.log(`  ${model} → accounts[${validIndexes.join(",")}]`);
+    };
+
+    console.log(`[AccountPool] Pre-assigning priority model pools across ${count} accounts:`);
+
+    // Kisworo's priority allocation for 18 Freebuff tokens:
+    // v4-pro gets most capacity, then v4-flash, then GLM-5.2, then minimax.
+    assign("deepseek/deepseek-v4-pro", this.range(0, 8));
+    assign("deepseek/deepseek-v4-flash", this.range(8, 5));
+    assign("z-ai/glm-5.2", this.range(13, 4));
+
+    const minimaxPool = this.range(17, 1);
+    assign("minimax/minimax-m2.7", minimaxPool);
+    assign("minimax/minimax-m3", minimaxPool);
+
+    // Wrapper/low-priority models are pinned to an existing pool instead of
+    // borrowing random tokens. This preserves strict routing semantics.
+    assign("google/gemini-2.5-flash-lite", this.modelToAccounts.get("deepseek/deepseek-v4-flash") || []);
+    assign("google/gemini-3.1-flash-lite-preview", this.modelToAccounts.get("deepseek/deepseek-v4-flash") || []);
+    assign("moonshotai/kimi-k2.6", minimaxPool);
+    assign("mimo/mimo-v2.5", minimaxPool);
+    assign("mimo/mimo-v2.5-pro", minimaxPool);
+    assign("google/gemini-3.1-pro-preview", minimaxPool);
+  }
+
+  private range(start: number, length: number): number[] {
+    return Array.from({ length }, (_, i) => start + i);
+  }
+
+  private reserveFromModelPool(model: string, pool: number[]): number | null {
+    const start = this.nextModelPoolIndex.get(model) || 0;
+    for (let i = 0; i < pool.length; i++) {
+      const poolOffset = (start + i) % pool.length;
+      const idx = pool[poolOffset];
+      if (!this.accounts[idx].busy) {
+        this.accounts[idx].busy = true;
+        this.nextModelPoolIndex.set(model, (poolOffset + 1) % pool.length);
+        return idx;
+      }
+    }
+    return null;
+  }
+
   private async releaseAccount(index: number): Promise<void> {
     const nextWaiter = this.waitingQueue.shift();
     if (nextWaiter) {
+      // Keep account marked busy; ownership transfers directly to the waiter.
       nextWaiter(index);
     } else {
       this.accounts[index].busy = false;

@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { resolveModel, modelsResponse, getSessionId } from "./models";
-import { CodebuffAccountPool, utcNowIso, FreebuffRun, CodebuffClient } from "./codebuff";
+import { CodebuffAccountPool, utcNowIso, FreebuffRun, CodebuffClient, CodebuffError } from "./codebuff";
 import { buildUpstreamPayload, sanitizeStreamChunk, CompletionAccumulator } from "./openai_compat";
 
 function runInBackground(c: any, fn: () => Promise<any>) {
@@ -17,6 +17,22 @@ function runInBackground(c: any, fn: () => Promise<any>) {
 }
 
 const app = new Hono<{ Bindings: Record<string, string> }>();
+
+const CHAT_FAIL_FAST_MS = 30000;
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await (Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new CodebuffError(message, 504)), ms);
+      }),
+    ]) as Promise<T>);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
 
 let pool: CodebuffAccountPool | null = null;
 
@@ -63,12 +79,20 @@ app.post("/v1/chat/completions", async (c) => {
     // 1. Acquire session lease from the pool (rotates keys, locks sessions, validation, ads)
     // Use session model ID for account routing; actual model ID for session creation
     const sessionModel = getSessionId(modelConfig);
-    lease = await accountPool.acquireSession(modelConfig.id, body.messages, sessionModel);
+    lease = await withTimeout(
+      accountPool.acquireSession(modelConfig.id, body.messages, sessionModel),
+      CHAT_FAIL_FAST_MS,
+      `Upstream session timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
+    );
     const client = lease.client;
     const session = lease.session;
 
     // 2. Start freebuff run chain
-    const run = await startFreebuffRunChain(client, modelConfig);
+    const run = await withTimeout(
+      startFreebuffRunChain(client, modelConfig),
+      CHAT_FAIL_FAST_MS,
+      `Upstream run setup timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
+    );
 
     // 3. Build upstream payload
     const traceSessionId = crypto.randomUUID();
@@ -81,7 +105,11 @@ app.post("/v1/chat/completions", async (c) => {
     });
 
     if (body.stream === true) {
-      const responseStream = await client.chatEventsStream(payload);
+      const responseStream: Response = await withTimeout<Response>(
+        client.chatEventsStream(payload),
+        CHAT_FAIL_FAST_MS,
+        `Upstream chat connection timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
+      );
       
       const { readable, writable } = new TransformStream();
       const writer = writable.getWriter();
@@ -92,7 +120,7 @@ app.post("/v1/chat/completions", async (c) => {
         const reader = responseStream.body!.getReader();
         const encoder = new TextEncoder();
         try {
-          for await (const line of getLines(reader)) {
+          for await (const line of getLines(reader, CHAT_FAIL_FAST_MS)) {
             const data = decodeSseData(line);
             if (data === null) continue;
             if (data === "[DONE]") {
@@ -134,13 +162,17 @@ app.post("/v1/chat/completions", async (c) => {
         },
       });
     } else {
-      const responseStream = await client.chatEventsStream(payload);
+      const responseStream: Response = await withTimeout<Response>(
+        client.chatEventsStream(payload),
+        CHAT_FAIL_FAST_MS,
+        `Upstream chat connection timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
+      );
       const reader = responseStream.body!.getReader();
       const accumulator = new CompletionAccumulator(modelConfig.id);
       let messageId: string | null = null;
 
       try {
-        for await (const line of getLines(reader)) {
+        for await (const line of getLines(reader, CHAT_FAIL_FAST_MS)) {
           const data = decodeSseData(line);
           if (data === null) continue;
           if (data === "[DONE]") break;
@@ -256,12 +288,16 @@ async function finalizeRun(client: CodebuffClient, run: FreebuffRun, messageId: 
   }
 }
 
-async function* getLines(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<string, void, unknown> {
+async function* getLines(reader: ReadableStreamDefaultReader<Uint8Array>, readTimeoutMs: number): AsyncGenerator<string, void, unknown> {
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await withTimeout(
+        reader.read(),
+        readTimeoutMs,
+        `Upstream chat read timeout after ${readTimeoutMs / 1000}s`
+      );
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
