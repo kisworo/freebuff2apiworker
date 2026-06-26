@@ -648,13 +648,13 @@ export class CodebuffAccountPool {
 
     console.log(`[AccountPool] Pre-assigning priority model pools across ${count} accounts:`);
 
-    // Kisworo's priority allocation for 18 Freebuff tokens:
-    // v4-pro gets most capacity, then v4-flash, then dedicated Mimo Pro, then minimax.
-    assign("deepseek/deepseek-v4-pro", this.range(0, 8));
-    assign("deepseek/deepseek-v4-flash", this.range(8, 5));
-    assign("mimo/mimo-v2.5-pro", this.range(13, 4));
+    // Kisworo's priority allocation for 14 Freebuff tokens:
+    // v4-pro gets 6 tokens, v4-flash gets 3, Mimo Pro gets 4 dedicated, then 1 shared low-priority token.
+    assign("deepseek/deepseek-v4-pro", this.range(0, 6));
+    assign("deepseek/deepseek-v4-flash", this.range(6, 3));
+    assign("mimo/mimo-v2.5-pro", this.range(9, 4));
 
-    const minimaxPool = this.range(17, 1);
+    const minimaxPool = this.range(13, 1);
     assign("minimax/minimax-m2.7", minimaxPool);
     assign("minimax/minimax-m3", minimaxPool);
 
