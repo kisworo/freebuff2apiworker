@@ -69,6 +69,34 @@ export function normalizeChatMessages(messages: any): any[] {
   return normalized;
 }
 
+const DEFAULT_MAX_TOKENS = 4096;
+const DEFAULT_MAX_TOKEN_CAP = 8192;
+
+function tokenPolicyForModel(modelId: string): { min: number; cap: number } {
+  if (modelId.includes("minimax")) {
+    return { min: 2048, cap: DEFAULT_MAX_TOKEN_CAP };
+  }
+  // Reasoning-heavy priority models need enough budget for hidden reasoning
+  // plus final answer; small client values otherwise produce empty/truncated
+  // content with only reasoning_content.
+  if (
+    modelId === "deepseek/deepseek-v4-pro" ||
+    modelId === "deepseek/deepseek-v4-flash" ||
+    modelId === "z-ai/glm-5.2"
+  ) {
+    return { min: DEFAULT_MAX_TOKENS, cap: DEFAULT_MAX_TOKEN_CAP };
+  }
+  return { min: DEFAULT_MAX_TOKENS, cap: DEFAULT_MAX_TOKEN_CAP };
+}
+
+function normalizeTokenLimit(value: any, policy: { min: number; cap: number }): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return policy.min;
+  }
+  return Math.min(Math.max(Math.floor(parsed), policy.min), policy.cap);
+}
+
 export function buildUpstreamPayload({
   body,
   instanceId,
@@ -91,6 +119,11 @@ export function buildUpstreamPayload({
 
   const modelConfig = resolveModel(body.model);
   payload.model = getUpstreamId(modelConfig);
+  const tokenPolicy = tokenPolicyForModel(modelConfig.id);
+  const requestedTokenLimit = payload.max_completion_tokens ?? payload.max_tokens;
+  const normalizedTokenLimit = normalizeTokenLimit(requestedTokenLimit, tokenPolicy);
+  payload.max_tokens = normalizedTokenLimit;
+  payload.max_completion_tokens = normalizedTokenLimit;
   payload.messages = normalizeChatMessages(body.messages);
   payload.stream = true;
   if (payload.stop === undefined || payload.stop === null) {
