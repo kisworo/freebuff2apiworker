@@ -649,10 +649,10 @@ export class CodebuffAccountPool {
     console.log(`[AccountPool] Pre-assigning priority model pools across ${count} accounts:`);
 
     // Kisworo's priority allocation for 18 Freebuff tokens:
-    // v4-pro gets most capacity, then v4-flash, then GLM-5.2, then minimax.
+    // v4-pro gets most capacity, then v4-flash, then dedicated Mimo Pro, then minimax.
     assign("deepseek/deepseek-v4-pro", this.range(0, 8));
     assign("deepseek/deepseek-v4-flash", this.range(8, 5));
-    assign("z-ai/glm-5.2", this.range(13, 4));
+    assign("mimo/mimo-v2.5-pro", this.range(13, 4));
 
     const minimaxPool = this.range(17, 1);
     assign("minimax/minimax-m2.7", minimaxPool);
@@ -664,7 +664,6 @@ export class CodebuffAccountPool {
     assign("google/gemini-3.1-flash-lite-preview", this.modelToAccounts.get("deepseek/deepseek-v4-flash") || []);
     assign("moonshotai/kimi-k2.6", minimaxPool);
     assign("mimo/mimo-v2.5", minimaxPool);
-    assign("mimo/mimo-v2.5-pro", minimaxPool);
     assign("google/gemini-3.1-pro-preview", minimaxPool);
   }
 
