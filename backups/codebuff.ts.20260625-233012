@@ -1,4 +1,4 @@
-import { agentValidationPayload } from "./models";
+import { agentValidationPayload, ALL_MODELS, getSessionId } from "./models";
 
 export class CodebuffError extends Error {
   public status_code: number;
@@ -52,14 +52,6 @@ export class Mutex {
     return new Promise<void>(resolve => {
       this.queue.push(resolve);
     });
-  }
-
-  tryAcquire(): boolean {
-    if (!this.locked) {
-      this.locked = true;
-      return true;
-    }
-    return false;
   }
 
   release(): void {
@@ -161,7 +153,7 @@ export class CodebuffClient {
 
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000);
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
       const response = await fetch(url, {
         method,
         headers: reqHeaders,
@@ -393,7 +385,7 @@ export class CodebuffClient {
     }
 
     const streamController = new AbortController();
-    const streamTimeoutId = setTimeout(() => streamController.abort(), 60000);
+    const streamTimeoutId = setTimeout(() => streamController.abort(), 120000);
     const response = await fetch(url, {
       method: "POST",
       headers: reqHeaders,
@@ -493,69 +485,7 @@ export class SessionManager {
   }
 
   private isSessionFresh(session: FreebuffSession): boolean {
-    return session.remaining_ms === undefined || session.remaining_ms > 10000;
-  }
-
-  private warmingModels = new Set<string>();
-
-  public async warmSession(model: string): Promise<void> {
-    if (this.warmingModels.has(model)) return;
-
-    if (!this.lock.tryAcquire()) return;
-
-    try {
-      this.warmingModels.add(model);
-
-      const cached = this.sessions.get(model);
-      if (cached && this.isSessionFresh(cached)) {
-        try {
-          const data = await this.client.getSession(cached.instance_id);
-          if (data.status === "active") {
-            cached.remaining_ms = data.remainingMs;
-            console.log(`[Codebuff] Warmed session (still active) model=${model} remaining_ms=${cached.remaining_ms}`);
-            return;
-          }
-        } catch {
-          this.sessions.delete(model);
-        }
-      }
-
-      await this.client.requestAdChain();
-
-      try {
-        const session = await this.client.createSession(model);
-        const check = await this.client.getSession(session.instance_id);
-        if (check.status === "active" && check.model && check.model !== model) {
-          console.log(`[Codebuff] Warm session model mismatch: got=${check.model} want=${model}, retrying...`);
-          await this.client.deleteSession();
-          await delay(500);
-          const retrySession = await this.client.createSession(model);
-          this.sessions.set(model, retrySession);
-          console.log(`[Codebuff] Warmed session (retry) model=${model} remaining_ms=${retrySession.remaining_ms}`);
-          return;
-        }
-        this.sessions.set(model, session);
-        console.log(`[Codebuff] Warmed session (created) model=${model} remaining_ms=${session.remaining_ms}`);
-      } catch (err: any) {
-        if (String(err).includes("model_locked")) {
-          console.log(`[Codebuff] Warm session locked; delete and retry model=${model}`);
-          await this.client.deleteSession();
-          this.sessions.clear();
-          await delay(500);
-          await this.client.requestAdChain();
-          const session = await this.client.createSession(model);
-          this.sessions.set(model, session);
-          console.log(`[Codebuff] Warmed session (retry after lock) model=${model} remaining_ms=${session.remaining_ms}`);
-        } else {
-          console.warn(`[Codebuff] Session warm failed model=${model}`, err);
-        }
-      }
-    } catch (err) {
-      console.warn(`[Codebuff] Session warm failed model=${model}`, err);
-    } finally {
-      this.warmingModels.delete(model);
-      this.lock.release();
-    }
+    return session.remaining_ms === undefined || session.remaining_ms > 60000;
   }
 
   private async deleteLockedSession(requestedModel: string): Promise<FreebuffSession | null> {
@@ -604,15 +534,14 @@ export interface CodebuffAccountLease {
   release: () => Promise<void>;
 }
 
-const LEASE_TIMEOUT_MS = 120000; // 120s — fail fast when upstream is slow/stuck so clients don't appear hung
+const LEASE_TIMEOUT_MS = 90000; // 90s — was 5min, too long caused cascade deadlock when upstream slow
 
 export class CodebuffAccountPool {
   private accounts: CodebuffAccount[] = [];
   private nextIndex = 0;
   private waitingQueue: ((idx: number) => void)[] = [];
-  private modelToAccounts = new Map<string, number[]>();
-  private nextModelPoolIndex = new Map<string, number>();
-  private modelPoolQueues = new Map<string, ((idx: number) => void)[]>();
+  private waitingByAccount = new Map<number, ((idx: number) => void)[]>();
+  private modelToAccount = new Map<string, number>();
   private leaseTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
   constructor(env: CodebuffEnv) {
@@ -629,7 +558,14 @@ export class CodebuffAccountPool {
       });
     }
 
-    this.assignModelPools();
+    // Pre-assign each unique session model to a dedicated account (sticky)
+    const sessionModels = [...new Set(ALL_MODELS.map(m => getSessionId(m)))];
+    console.log(`[AccountPool] Pre-assigning ${sessionModels.length} session models to ${this.accounts.length} accounts:`);
+    sessionModels.forEach((sm, i) => {
+      const accountIdx = i % this.accounts.length;
+      this.modelToAccount.set(sm, accountIdx);
+      console.log(`  ${sm} → account[${accountIdx}]`);
+    });
   }
 
   public get accountCount(): number {
@@ -637,14 +573,14 @@ export class CodebuffAccountPool {
   }
 
   public async acquireSession(model: string, messages?: any[], routingKey?: string): Promise<CodebuffAccountLease> {
-    // Strict per-model token pools: a model may round-robin only within its
-    // assigned accounts, never borrow from another model's pool. This prevents
-    // Freebuff model_locked cascades while giving hot models more capacity.
-    const modelPool = routingKey ? this.modelToAccounts.get(routingKey) : undefined;
+    // Strict sticky routing: if a model has a pre-assigned account, wait for that
+    // exact account instead of borrowing another model's account. Borrowing caused
+    // cross-model session switches/model_locked cascades and saturated the pool.
+    const stickyIdx = routingKey ? this.modelToAccount.get(routingKey) : undefined;
     let accountIndex: number;
 
-    if (modelPool && modelPool.length > 0) {
-      accountIndex = await this.reserveFromModelPool(routingKey!, modelPool);
+    if (stickyIdx !== undefined) {
+      accountIndex = await this.reserveSpecificAccount(stickyIdx);
     } else {
       accountIndex = await this.reserveAccount();
     }
@@ -688,6 +624,19 @@ export class CodebuffAccountPool {
     }
   }
 
+  private async reserveSpecificAccount(index: number): Promise<number> {
+    if (!this.accounts[index].busy) {
+      this.accounts[index].busy = true;
+      return index;
+    }
+
+    return new Promise<number>(resolve => {
+      const queue = this.waitingByAccount.get(index) || [];
+      queue.push(resolve);
+      this.waitingByAccount.set(index, queue);
+    });
+  }
+
   private async reserveAccount(): Promise<number> {
     const index = this.nextAvailableIndex();
     if (index !== null) {
@@ -701,100 +650,25 @@ export class CodebuffAccountPool {
     });
   }
 
-  private assignModelPools(): void {
-    const count = this.accounts.length;
-    const assign = (model: string, indexes: number[]) => {
-      const validIndexes = indexes.filter(idx => idx >= 0 && idx < count);
-      if (validIndexes.length === 0) return;
-      this.modelToAccounts.set(model, validIndexes);
-      console.log(`  ${model} → accounts[${validIndexes.join(",")}]`);
-    };
-
-    console.log(`[AccountPool] Pre-assigning priority model pools across ${count} accounts:`);
-
-    // Kisworo's priority allocation for 14 Freebuff tokens:
-    // v4-pro gets 7 tokens, v4-flash gets 2, Mimo Pro gets 4 dedicated, then 1 shared low-priority token.
-    assign("deepseek/deepseek-v4-pro", this.range(0, 7));
-    assign("deepseek/deepseek-v4-flash", this.range(7, 2));
-    assign("mimo/mimo-v2.5-pro", this.range(9, 4));
-
-    const minimaxPool = this.range(13, 1);
-    assign("minimax/minimax-m2.7", minimaxPool);
-    assign("minimax/minimax-m3", minimaxPool);
-
-    // Wrapper/low-priority models are pinned to an existing pool instead of
-    // borrowing random tokens. This preserves strict routing semantics.
-    assign("google/gemini-2.5-flash-lite", this.modelToAccounts.get("deepseek/deepseek-v4-flash") || []);
-    assign("google/gemini-3.1-flash-lite-preview", this.modelToAccounts.get("deepseek/deepseek-v4-flash") || []);
-    assign("moonshotai/kimi-k2.6", minimaxPool);
-    assign("mimo/mimo-v2.5", minimaxPool);
-    assign("google/gemini-3.1-pro-preview", minimaxPool);
-  }
-
-  private range(start: number, length: number): number[] {
-    return Array.from({ length }, (_, i) => start + i);
-  }
-
-  private reserveFromModelPool(model: string, pool: number[]): number | Promise<number> {
-    const start = this.nextModelPoolIndex.get(model) || 0;
-    for (let i = 0; i < pool.length; i++) {
-      const poolOffset = (start + i) % pool.length;
-      const idx = pool[poolOffset];
-      if (!this.accounts[idx].busy) {
-        this.accounts[idx].busy = true;
-        this.nextModelPoolIndex.set(model, (poolOffset + 1) % pool.length);
-        return idx;
-      }
+  private async releaseAccount(index: number): Promise<void> {
+    const accountWaiters = this.waitingByAccount.get(index);
+    const specificWaiter = accountWaiters?.shift();
+    if (accountWaiters && accountWaiters.length === 0) {
+      this.waitingByAccount.delete(index);
     }
 
-    // All accounts in this pool are busy — join the model-specific queue
-    return new Promise<number>(resolve => {
-      let queue = this.modelPoolQueues.get(model);
-      if (!queue) {
-        queue = [];
-        this.modelPoolQueues.set(model, queue);
-      }
-      queue.push(resolve);
-    });
-  }
+    if (specificWaiter) {
+      // Keep account marked busy; ownership transfers directly to the waiter.
+      specificWaiter(index);
+      return;
+    }
 
-  private async releaseAccount(index: number): Promise<void> {
     const nextWaiter = this.waitingQueue.shift();
     if (nextWaiter) {
       // Keep account marked busy; ownership transfers directly to the waiter.
       nextWaiter(index);
-      return;
-    }
-
-    // Check per-model pool queues — find a waiter for any model this account serves
-    for (const [model, pool] of this.modelToAccounts) {
-      if (pool.includes(index)) {
-        const queue = this.modelPoolQueues.get(model);
-        if (queue && queue.length > 0) {
-          const waiter = queue.shift()!;
-          if (queue.length === 0) this.modelPoolQueues.delete(model);
-          waiter(index);
-          return;
-        }
-      }
-    }
-
-    this.accounts[index].busy = false;
-    // Account is idle: warm sessions for models in this account's pool
-    this.warmAccountSessions(index);
-  }
-
-  private warmAccountSessions(index: number): void {
-    const account = this.accounts[index];
-    // Warm only the first assigned model for this account to avoid
-    // session thrashing on accounts that serve multiple models.
-    for (const [model, pool] of this.modelToAccounts) {
-      if (pool.includes(index)) {
-        account.sessions.warmSession(model).catch(err =>
-          console.warn(`[AccountPool] Background warm failed model=${model} account=${index}`, err)
-        );
-        return; // One model per idle window
-      }
+    } else {
+      this.accounts[index].busy = false;
     }
   }
 
