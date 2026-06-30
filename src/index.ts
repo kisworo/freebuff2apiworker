@@ -18,7 +18,7 @@ function runInBackground(c: any, fn: () => Promise<any>) {
 
 const app = new Hono<{ Bindings: Record<string, string> }>();
 
-const CHAT_FAIL_FAST_MS = 30000;
+const CHAT_FAIL_FAST_MS = 60000;
 
 async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;

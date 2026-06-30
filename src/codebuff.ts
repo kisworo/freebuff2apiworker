@@ -153,7 +153,7 @@ export class CodebuffClient {
 
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      const timeoutId = setTimeout(() => controller.abort(), 60000);
       const response = await fetch(url, {
         method,
         headers: reqHeaders,
@@ -534,7 +534,7 @@ export interface CodebuffAccountLease {
   release: () => Promise<void>;
 }
 
-const LEASE_TIMEOUT_MS = 60000; // 60s — fail fast when upstream is slow/stuck so clients don't appear hung
+const LEASE_TIMEOUT_MS = 120000; // 120s — fail fast when upstream is slow/stuck so clients don't appear hung
 
 export class CodebuffAccountPool {
   private accounts: CodebuffAccount[] = [];

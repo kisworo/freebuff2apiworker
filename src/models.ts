@@ -15,6 +15,7 @@ export const FREEBUFF_MODELS: FreebuffModel[] = [
   { id: "minimax/minimax-m3", agent_id: "base2-free-minimax-m3", owned_by: "minimax" },
   { id: "mimo/mimo-v2.5", agent_id: "base2-free-mimo", owned_by: "mimo" },
   { id: "mimo/mimo-v2.5-pro", agent_id: "base2-free-mimo-pro", owned_by: "mimo" },
+  { id: "z-ai/glm-5.2", agent_id: "base2-free-glm", owned_by: "z-ai" },
 ];
 
 export const CONTEXT_PRUNER_AGENT_ID = "context-pruner";
