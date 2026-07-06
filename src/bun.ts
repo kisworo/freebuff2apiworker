@@ -18,12 +18,12 @@ if (fs.existsSync(devVarsPath)) {
   console.log("[Bun Server] Loaded variables from .dev.vars");
 }
 
-const port = 7300; // Use port 7300
-console.log(`[Bun Server] Starting Hono app on port ${port}...`);
+const port = 7300;
+console.log(`[Bun Server] Starting Hono app on port ${port} (idleTimeout=255s)...`);
 
 Bun.serve({
-  fetch: (request, server) => {
-    return app.fetch(request, process.env);
-  },
-  port: port,
+  fetch: (request) => app.fetch(request, process.env),
+  port,
+  // Default Bun idleTimeout is 10s — kills long SSE gaps during tool calls. Max 255.
+  idleTimeout: 255,
 });
