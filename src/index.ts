@@ -1,216 +1,329 @@
 import { Hono } from "hono";
-import http from "node:http";
-import { Readable } from "node:stream";
+import { resolveModel, modelsResponse, getSessionId } from "./models";
+import { CodebuffAccountPool, utcNowIso, FreebuffRun, CodebuffClient, CodebuffError } from "./codebuff";
+import { buildUpstreamPayload, sanitizeStreamChunk, CompletionAccumulator } from "./openai_compat";
+
+function runInBackground(c: any, fn: () => Promise<any>) {
+  try {
+    const ctx = c.executionCtx;
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(fn());
+      return;
+    }
+  } catch (err) {
+    // Ignore "This context has no ExecutionContext" error
+  }
+  fn().catch(err => console.error("[Worker] Background task failed", err));
+}
 
 const app = new Hono<{ Bindings: Record<string, string> }>();
 
-function envInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+const CHAT_FAIL_FAST_MS = 60000;
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await (Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new CodebuffError(message, 504)), ms);
+      }),
+    ]) as Promise<T>);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 }
 
-const UPSTREAM_HOST = process.env.FREEBUFF_UPSTREAM_HOST || "127.0.0.1";
-const UPSTREAM_PORT = envInt("FREEBUFF_UPSTREAM_PORT", 8787);
-const UPSTREAM_TIMEOUT_MS = envInt("FREEBUFF_UPSTREAM_TIMEOUT_MS", 600_000);
-const SSE_KEEPALIVE_MS = envInt("FREEBUFF_SSE_KEEPALIVE_MS", 15_000);
+let pool: CodebuffAccountPool | null = null;
 
-// Public health (no auth) — for monitoring / load balancers
-app.get("/healthz", (c) =>
-  c.json({
-    status: "ok",
-    mode: "proxy",
-    upstream: `${UPSTREAM_HOST}:${UPSTREAM_PORT}`,
-    idleTimeout: 255,
-    sseKeepaliveMs: SSE_KEEPALIVE_MS,
-    upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
-  }),
-);
-
-app.use("*", async (c, next) => {
-  const localApiKey = process.env.FREEBUFF_API_KEY || c.env.FREEBUFF_API_KEY;
-  if (!localApiKey) {
-    console.error("[Auth] FREEBUFF_API_KEY not set — rejecting request");
-    return c.json({ detail: "Server misconfigured: missing API key" }, 503);
+function getPool(env: any): CodebuffAccountPool {
+  if (!pool) {
+    pool = new CodebuffAccountPool(env);
+    console.log(`[Worker] Initialized CodebuffAccountPool with count=${pool.accountCount}`);
   }
-  const authHeader = c.req.header("Authorization");
-  if (authHeader !== `Bearer ${localApiKey}`) {
-    return c.json({ detail: "Invalid API key" }, 401);
+  return pool;
+}
+
+// Auth middleware
+app.use("*", async (c, next) => {
+  const localApiKey = c.env.FREEBUFF_API_KEY;
+  if (localApiKey) {
+    const authHeader = c.req.header("Authorization");
+    if (authHeader !== `Bearer ${localApiKey}`) {
+      return c.json({ detail: "Invalid API key" }, 401);
+    }
   }
   await next();
 });
 
-function isEventStream(headers: Record<string, string | string[] | undefined>): boolean {
-  const ct = headers["content-type"];
-  const v = Array.isArray(ct) ? ct.join(",") : ct || "";
-  return v.toLowerCase().includes("text/event-stream");
-}
+// health check
+app.get("/healthz", (c) => c.json({ status: "ok" }));
 
-function peekChatMeta(body: string | undefined): { model: string; stream: boolean } {
-  if (!body) return { model: "-", stream: false };
+// models list
+app.get("/v1/models", (c) => c.json(modelsResponse()));
+
+// chat completions
+app.post("/v1/chat/completions", async (c) => {
+  const body = await c.req.json();
+  let modelConfig;
   try {
-    const j = JSON.parse(body) as { model?: string; stream?: boolean };
-    return { model: j.model || "-", stream: !!j.stream };
-  } catch {
-    return { model: "?", stream: false };
+    modelConfig = resolveModel(body.model);
+  } catch (err: any) {
+    return c.json({ detail: err.message }, 400);
   }
-}
 
-function withSseKeepalive(
-  body: ReadableStream<Uint8Array>,
-  intervalMs: number,
-  onClientAbort?: () => void,
-): ReadableStream<Uint8Array> {
-  const reader = body.getReader();
-  const enc = new TextEncoder();
-  let timer: ReturnType<typeof setInterval> | null = null;
-  let closed = false;
+  const accountPool = getPool(c.env);
+  let lease: any = null;
 
-  const cleanup = () => {
-    closed = true;
-    if (timer) clearInterval(timer);
-    timer = null;
-    reader.cancel().catch(() => {});
-    onClientAbort?.();
-  };
+  try {
+    // 1. Acquire session lease from the pool (rotates keys, locks sessions, validation, ads)
+    // Use session model ID for account routing; actual model ID for session creation
+    const sessionModel = getSessionId(modelConfig);
+    lease = await withTimeout(
+      accountPool.acquireSession(modelConfig.id, body.messages, sessionModel),
+      CHAT_FAIL_FAST_MS,
+      `Upstream session timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
+    );
+    const client = lease.client;
+    const session = lease.session;
 
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      timer = setInterval(() => {
-        if (closed) return;
-        try {
-          controller.enqueue(enc.encode(": keepalive\n\n"));
-        } catch {
-          cleanup();
-        }
-      }, intervalMs);
-    },
-    async pull(controller) {
-      if (closed) return;
-      const { done, value } = await reader.read();
-      if (done) {
-        cleanup();
-        controller.close();
-        return;
-      }
-      if (value?.length) controller.enqueue(value);
-    },
-    cancel() {
-      cleanup();
-    },
-  });
-}
-
-function proxyHttp(
-  method: string,
-  pathWithQuery: string,
-  headers: Record<string, string>,
-  body: string | undefined,
-  clientSignal: AbortSignal | undefined,
-  meta: { model: string; stream: boolean },
-): Promise<Response> {
-  const started = Date.now();
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        host: UPSTREAM_HOST,
-        port: UPSTREAM_PORT,
-        method,
-        path: pathWithQuery,
-        headers: { ...headers, host: `${UPSTREAM_HOST}:${UPSTREAM_PORT}` },
-        timeout: 0,
-      },
-      (res) => {
-        res.on("end", () => {
-          console.log(
-            `[Proxy] done ${method} ${pathWithQuery} model=${meta.model} stream=${meta.stream} status=${res.statusCode} ${Date.now() - started}ms`,
-          );
-        });
-
-        const outHeaders = new Headers();
-        for (const [k, v] of Object.entries(res.headers)) {
-          if (v === undefined) continue;
-          outHeaders.set(k, Array.isArray(v) ? v.join(", ") : String(v));
-        }
-        // Help nginx not buffer SSE
-        if (isEventStream(res.headers)) {
-          outHeaders.set("X-Accel-Buffering", "no");
-        }
-
-        let stream = Readable.toWeb(res) as ReadableStream<Uint8Array>;
-        if (isEventStream(res.headers)) {
-          stream = withSseKeepalive(stream, SSE_KEEPALIVE_MS, () => req.destroy());
-        }
-
-        resolve(
-          new Response(stream, {
-            status: res.statusCode || 502,
-            headers: outHeaders,
-          }),
-        );
-      },
+    // 2. Start freebuff run chain
+    const run = await withTimeout(
+      startFreebuffRunChain(client, modelConfig),
+      CHAT_FAIL_FAST_MS,
+      `Upstream run setup timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
     );
 
-    const wallTimer = setTimeout(() => {
-      req.destroy(new Error("upstream wall timeout"));
-    }, UPSTREAM_TIMEOUT_MS);
+    // 3. Build upstream payload
+    const traceSessionId = crypto.randomUUID();
+    const payload = buildUpstreamPayload({
+      body,
+      instanceId: session.instance_id,
+      runId: run.chat_run_id || run.run_id,
+      clientId: c.env.CLIENT_ID || "freebuff-cli-worker",
+      traceSessionId,
+    });
 
-    const onAbort = () => req.destroy(new Error("client aborted"));
-    if (clientSignal) {
-      if (clientSignal.aborted) onAbort();
-      else clientSignal.addEventListener("abort", onAbort, { once: true });
+    if (body.stream === true) {
+      const responseStream: Response = await withTimeout<Response>(
+        client.chatEventsStream(payload),
+        CHAT_FAIL_FAST_MS,
+        `Upstream chat connection timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
+      );
+      
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+      
+      const activeLease = lease;
+      runInBackground(c, async () => {
+        let messageId: string | null = null;
+        const reader = responseStream.body!.getReader();
+        const encoder = new TextEncoder();
+        try {
+          for await (const line of getLines(reader, CHAT_FAIL_FAST_MS)) {
+            const data = decodeSseData(line);
+            if (data === null) continue;
+            if (data === "[DONE]") {
+              await writer.write(encoder.encode("data: [DONE]\n\n"));
+              break;
+            }
+            if (data.id) {
+              messageId = data.id;
+            }
+            const chunk = sanitizeStreamChunk(data);
+            if (chunk !== null) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            }
+          }
+        } catch (err: any) {
+          console.error("[Worker] Error in stream forwarding", err);
+          const errChunk = {
+            error: {
+              message: err.message || String(err),
+              type: "upstream_error",
+              code: "codebuff_error",
+            }
+          };
+          await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+        } finally {
+          await writer.close();
+          // Finalize run and release token lease in background
+          await finalizeRun(client, run, messageId);
+          await activeLease.release();
+        }
+      });
+
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          "Connection": "keep-alive",
+        },
+      });
+    } else {
+      const responseStream: Response = await withTimeout<Response>(
+        client.chatEventsStream(payload),
+        CHAT_FAIL_FAST_MS,
+        `Upstream chat connection timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
+      );
+      const reader = responseStream.body!.getReader();
+      const accumulator = new CompletionAccumulator(modelConfig.id);
+      let messageId: string | null = null;
+
+      try {
+        for await (const line of getLines(reader, CHAT_FAIL_FAST_MS)) {
+          const data = decodeSseData(line);
+          if (data === null) continue;
+          if (data === "[DONE]") break;
+          if (data.id) {
+            messageId = data.id;
+          }
+          accumulator.add(data);
+        }
+        const finalObj = accumulator.finalResponse();
+        return c.json(finalObj);
+      } finally {
+        const activeLease = lease;
+        runInBackground(c, async () => {
+          await finalizeRun(client, run, messageId);
+          await activeLease.release();
+        });
+      }
+    }
+  } catch (err: any) {
+    console.error("[Worker] Request failed", err);
+    if (lease) {
+      await lease.release();
     }
 
-    req.on("error", (err) => {
-      clearTimeout(wallTimer);
-      console.error(
-        `[Proxy] fail ${method} ${pathWithQuery} model=${meta.model} stream=${meta.stream} ${Date.now() - started}ms: ${err.message}`,
-      );
-      reject(err);
-    });
-    req.on("close", () => clearTimeout(wallTimer));
-
-    if (body) req.write(body);
-    req.end();
-  });
-}
-
-app.all("/v1/*", async (c) => {
-  const url = new URL(c.req.url);
-  const pathWithQuery = url.pathname + url.search;
-  const method = c.req.method;
-  const headers: Record<string, string> = {};
-
-  c.req.raw.headers.forEach((value, key) => {
-    const lower = key.toLowerCase();
-    if (lower === "host" || lower === "connection" || lower === "content-length") return;
-    headers[key] = value;
-  });
-
-  try {
-    const body = method !== "GET" && method !== "HEAD" ? await c.req.text() : undefined;
-    if (body) headers["content-length"] = String(Buffer.byteLength(body));
-
-    const meta = peekChatMeta(body);
-    console.log(
-      `[Proxy] start ${method} ${pathWithQuery} -> http://${UPSTREAM_HOST}:${UPSTREAM_PORT}${pathWithQuery} model=${meta.model} stream=${meta.stream}`,
-    );
-
-    return await proxyHttp(method, pathWithQuery, headers, body, c.req.raw.signal, meta);
-  } catch (err: any) {
-    console.error("[Proxy] Upstream error:", err?.message || err);
-    return c.json(
-      {
-        error: {
-          message: `Upstream unavailable: ${err?.message || String(err)}`,
-          type: "proxy_error",
-          code: "upstream_error",
-        },
-      },
-      502,
-    );
+    return c.json({
+      error: {
+        message: err.message || String(err),
+        type: "upstream_error",
+        code: "codebuff_error",
+      }
+    }, err.status_code || 502);
   }
 });
+
+async function startFreebuffRunChain(client: CodebuffClient, model: any): Promise<FreebuffRun> {
+  if (model.parent_agent_id) {
+    return startChildChatRunChain(client, model);
+  }
+
+  const agent_id = model.agent_id;
+  const started_at = utcNowIso();
+  const run_id = await client.startRun(agent_id);
+  const child_started_at = utcNowIso();
+  const child_run_id = await client.startRun(
+    "context-pruner",
+    [run_id]
+  );
+  await client.recordRunStep(child_run_id, {
+    stepNumber: 1,
+    startTime: child_started_at,
+  });
+  await client.finishRun(child_run_id, 2);
+  await client.recordRunStep(run_id, {
+    stepNumber: 1,
+    childRunIds: [child_run_id],
+    startTime: started_at,
+  });
+  return {
+    run_id,
+    agent_id,
+    started_at,
+    child_run_id,
+  };
+}
+
+async function startChildChatRunChain(client: CodebuffClient, model: any): Promise<FreebuffRun> {
+  const started_at = utcNowIso();
+  const parent_run_id = await client.startRun(model.parent_agent_id);
+  const chat_started_at = utcNowIso();
+  const chat_run_id = await client.startRun(
+    model.agent_id,
+    [parent_run_id]
+  );
+  return {
+    run_id: parent_run_id,
+    agent_id: model.parent_agent_id,
+    started_at,
+    child_run_id: chat_run_id,
+    chat_run_id,
+    chat_started_at,
+  };
+}
+
+async function finalizeRun(client: CodebuffClient, run: FreebuffRun, messageId: string | null): Promise<void> {
+  try {
+    console.log(`[Codebuff] Finalizing run ID=${run.run_id} MsgID=${messageId}`);
+    if (run.chat_run_id && run.chat_run_id !== run.run_id) {
+      await client.recordRunStep(run.chat_run_id, {
+        stepNumber: 1,
+        messageId,
+        startTime: run.chat_started_at || run.started_at,
+      });
+      await client.finishRun(run.chat_run_id, 2);
+      await client.recordRunStep(run.run_id, {
+        stepNumber: 1,
+        childRunIds: [run.chat_run_id],
+        startTime: run.started_at,
+      });
+      await client.finishRun(run.run_id, 2);
+      console.log(`[Codebuff] Finalized parent/child run done run_id=${run.run_id}`);
+      return;
+    }
+
+    await client.recordRunStep(run.run_id, {
+      stepNumber: 2,
+      messageId,
+      startTime: run.started_at,
+    });
+    await client.finishRun(run.run_id, 3);
+    console.log(`[Codebuff] Finalized run done run_id=${run.run_id}`);
+  } catch (err) {
+    console.warn(`[Codebuff] Finalize run failed run_id=${run.run_id}`, err);
+  }
+}
+
+async function* getLines(reader: ReadableStreamDefaultReader<Uint8Array>, readTimeoutMs: number): AsyncGenerator<string, void, unknown> {
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await withTimeout(
+        reader.read(),
+        readTimeoutMs,
+        `Upstream chat read timeout after ${readTimeoutMs / 1000}s`
+      );
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        yield line;
+      }
+    }
+    if (buffer) {
+      yield buffer;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function decodeSseData(line: string): any {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("data:")) return null;
+  const dataVal = trimmed.slice(5).trim();
+  if (dataVal === "[DONE]") return "[DONE]";
+  try {
+    return JSON.parse(dataVal);
+  } catch {
+    return null;
+  }
+}
 
 export default app;
