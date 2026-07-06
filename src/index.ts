@@ -4,30 +4,57 @@ import { Readable } from "node:stream";
 
 const app = new Hono<{ Bindings: Record<string, string> }>();
 
-const UPSTREAM_HOST = "127.0.0.1";
-const UPSTREAM_PORT = 8787;
-const UPSTREAM_TIMEOUT_MS = 600_000;
-const SSE_KEEPALIVE_MS = 15_000;
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const UPSTREAM_HOST = process.env.FREEBUFF_UPSTREAM_HOST || "127.0.0.1";
+const UPSTREAM_PORT = envInt("FREEBUFF_UPSTREAM_PORT", 8787);
+const UPSTREAM_TIMEOUT_MS = envInt("FREEBUFF_UPSTREAM_TIMEOUT_MS", 600_000);
+const SSE_KEEPALIVE_MS = envInt("FREEBUFF_SSE_KEEPALIVE_MS", 15_000);
+
+// Public health (no auth) — for monitoring / load balancers
+app.get("/healthz", (c) =>
+  c.json({
+    status: "ok",
+    mode: "proxy",
+    upstream: `${UPSTREAM_HOST}:${UPSTREAM_PORT}`,
+    idleTimeout: 255,
+    sseKeepaliveMs: SSE_KEEPALIVE_MS,
+    upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
+  }),
+);
 
 app.use("*", async (c, next) => {
-  const localApiKey = c.env.FREEBUFF_API_KEY || "sk-xyz";
-  if (localApiKey) {
-    const authHeader = c.req.header("Authorization");
-    if (authHeader !== `Bearer ${localApiKey}`) {
-      return c.json({ detail: "Invalid API key" }, 401);
-    }
+  const localApiKey = process.env.FREEBUFF_API_KEY || c.env.FREEBUFF_API_KEY;
+  if (!localApiKey) {
+    console.error("[Auth] FREEBUFF_API_KEY not set — rejecting request");
+    return c.json({ detail: "Server misconfigured: missing API key" }, 503);
+  }
+  const authHeader = c.req.header("Authorization");
+  if (authHeader !== `Bearer ${localApiKey}`) {
+    return c.json({ detail: "Invalid API key" }, 401);
   }
   await next();
 });
-
-app.get("/healthz", (c) =>
-  c.json({ status: "ok", upstream: "cmdproxy", idleTimeout: 255, sseKeepaliveMs: SSE_KEEPALIVE_MS }),
-);
 
 function isEventStream(headers: Record<string, string | string[] | undefined>): boolean {
   const ct = headers["content-type"];
   const v = Array.isArray(ct) ? ct.join(",") : ct || "";
   return v.toLowerCase().includes("text/event-stream");
+}
+
+function peekChatMeta(body: string | undefined): { model: string; stream: boolean } {
+  if (!body) return { model: "-", stream: false };
+  try {
+    const j = JSON.parse(body) as { model?: string; stream?: boolean };
+    return { model: j.model || "-", stream: !!j.stream };
+  } catch {
+    return { model: "?", stream: false };
+  }
 }
 
 function withSseKeepalive(
@@ -81,7 +108,9 @@ function proxyHttp(
   headers: Record<string, string>,
   body: string | undefined,
   clientSignal: AbortSignal | undefined,
+  meta: { model: string; stream: boolean },
 ): Promise<Response> {
+  const started = Date.now();
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
@@ -93,10 +122,20 @@ function proxyHttp(
         timeout: 0,
       },
       (res) => {
+        res.on("end", () => {
+          console.log(
+            `[Proxy] done ${method} ${pathWithQuery} model=${meta.model} stream=${meta.stream} status=${res.statusCode} ${Date.now() - started}ms`,
+          );
+        });
+
         const outHeaders = new Headers();
         for (const [k, v] of Object.entries(res.headers)) {
           if (v === undefined) continue;
           outHeaders.set(k, Array.isArray(v) ? v.join(", ") : String(v));
+        }
+        // Help nginx not buffer SSE
+        if (isEventStream(res.headers)) {
+          outHeaders.set("X-Accel-Buffering", "no");
         }
 
         let stream = Readable.toWeb(res) as ReadableStream<Uint8Array>;
@@ -125,6 +164,9 @@ function proxyHttp(
 
     req.on("error", (err) => {
       clearTimeout(wallTimer);
+      console.error(
+        `[Proxy] fail ${method} ${pathWithQuery} model=${meta.model} stream=${meta.stream} ${Date.now() - started}ms: ${err.message}`,
+      );
       reject(err);
     });
     req.on("close", () => clearTimeout(wallTimer));
@@ -146,13 +188,16 @@ app.all("/v1/*", async (c) => {
     headers[key] = value;
   });
 
-  console.log(`[Proxy] ${method} ${pathWithQuery} -> http://${UPSTREAM_HOST}:${UPSTREAM_PORT}${pathWithQuery}`);
-
   try {
     const body = method !== "GET" && method !== "HEAD" ? await c.req.text() : undefined;
     if (body) headers["content-length"] = String(Buffer.byteLength(body));
 
-    return await proxyHttp(method, pathWithQuery, headers, body, c.req.raw.signal);
+    const meta = peekChatMeta(body);
+    console.log(
+      `[Proxy] start ${method} ${pathWithQuery} -> http://${UPSTREAM_HOST}:${UPSTREAM_PORT}${pathWithQuery} model=${meta.model} stream=${meta.stream}`,
+    );
+
+    return await proxyHttp(method, pathWithQuery, headers, body, c.req.raw.signal, meta);
   } catch (err: any) {
     console.error("[Proxy] Upstream error:", err?.message || err);
     return c.json(
