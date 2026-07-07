@@ -463,17 +463,6 @@ export class SessionManager {
 
     try {
       const session = await this.client.createSession(model);
-      // Validate the new session matches the requested model
-      const check = await this.client.getSession(session.instance_id);
-      if (check.status === "active" && check.model && check.model !== model) {
-        console.log(`[Codebuff] New session model mismatch after create: got=${check.model} want=${model}, retrying...`);
-        await this.client.deleteSession();
-        await delay(500);
-        const retrySession = await this.client.createSession(model);
-        this.sessions.set(model, retrySession);
-        console.log(`[Codebuff] Created session (retry) model=${model} instance_id=${retrySession.instance_id}`);
-        return retrySession;
-      }
       this.sessions.set(model, session);
       console.log(`[Codebuff] Created session model=${model} instance_id=${session.instance_id} remaining_ms=${session.remaining_ms}`);
       return session;
