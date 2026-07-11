@@ -19,36 +19,11 @@ export const FREEBUFF_MODELS: FreebuffModel[] = [
 ];
 
 export const CONTEXT_PRUNER_AGENT_ID = "context-pruner";
-export const GEMINI_THINKER_AGENT_ID = "thinker-with-files-gemini";
-export const GEMINI_THINKER_PARENT_AGENT_ID = "base2-free-kimi";
-export const GEMINI_THINKER_PARENT_MODEL_ID = "moonshotai/kimi-k2.6";
-export const GEMINI_FLASH_LITE_SESSION_MODEL_ID = FREEBUFF_MODELS[0].id;
 
-export const GEMINI_FREE_MODELS: FreebuffModel[] = [
-  {
-    id: "google/gemini-2.5-flash-lite",
-    agent_id: "file-picker",
-    owned_by: "google",
-    session_model_id: GEMINI_FLASH_LITE_SESSION_MODEL_ID,
-    parent_agent_id: FREEBUFF_MODELS[0].agent_id,
-  },
-  {
-    id: "google/gemini-3.1-flash-lite-preview",
-    agent_id: "file-picker-max",
-    owned_by: "google",
-    session_model_id: GEMINI_FLASH_LITE_SESSION_MODEL_ID,
-    parent_agent_id: FREEBUFF_MODELS[0].agent_id,
-  },
-  {
-    id: "google/gemini-3.1-pro-preview",
-    agent_id: GEMINI_THINKER_AGENT_ID,
-    owned_by: "google",
-    session_model_id: GEMINI_THINKER_PARENT_MODEL_ID,
-    parent_agent_id: GEMINI_THINKER_PARENT_AGENT_ID,
-  },
-];
+// Gemini wrappers removed — not used; keeps flash/pro pools free of shared-model contention.
+export const GEMINI_FREE_MODELS: FreebuffModel[] = [];
 
-export const ALL_MODELS = [...FREEBUFF_MODELS, ...GEMINI_FREE_MODELS];
+export const ALL_MODELS = [...FREEBUFF_MODELS];
 
 export function resolveModel(requested: string | null | undefined): FreebuffModel {
   const modelName = requested || FREEBUFF_MODELS[0].id;

@@ -43,6 +43,7 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export class Mutex {
   private queue: (() => void)[] = [];
   private locked = false;
+  private generation = 0;
 
   async acquire(): Promise<void> {
     if (!this.locked) {
@@ -69,6 +70,17 @@ export class Mutex {
     } else {
       this.locked = false;
     }
+  }
+
+  /** Hard-reset a stuck lock so a hung acquire/warm cannot permanently brick an account. */
+  forceReset(): void {
+    this.generation += 1;
+    this.queue = [];
+    this.locked = false;
+  }
+
+  getGeneration(): number {
+    return this.generation;
   }
 }
 
@@ -415,21 +427,38 @@ export class SessionManager {
   private client: CodebuffClient;
   private sessions = new Map<string, FreebuffSession>();
   private lock = new Mutex();
+  private warmingModels = new Set<string>();
 
   constructor(client: CodebuffClient) {
     this.client = client;
   }
 
+  /** Clear cache + mutex so a hung session path cannot keep the account unusable. */
+  public forceReset(reason = "manual"): void {
+    console.warn(`[Codebuff] Force-resetting session manager (${reason}) token=${this.client.getTokenPrefix()}`);
+    this.sessions.clear();
+    this.warmingModels.clear();
+    this.lock.forceReset();
+  }
+
   async acquireSession(model: string, messages?: any[]): Promise<{ session: FreebuffSession; release: () => void }> {
     await this.lock.acquire();
+    const genAtHold = this.lock.getGeneration();
     try {
       const session = await this.ensureSessionLocked(model, messages);
       return {
         session,
-        release: () => this.lock.release()
+        release: () => {
+          // Ignore stale holders after a force-reset.
+          if (this.lock.getGeneration() === genAtHold) {
+            this.lock.release();
+          }
+        }
       };
     } catch (err) {
-      this.lock.release();
+      if (this.lock.getGeneration() === genAtHold) {
+        this.lock.release();
+      }
       throw err;
     }
   }
@@ -485,12 +514,11 @@ export class SessionManager {
     return session.remaining_ms === undefined || session.remaining_ms > 10000;
   }
 
-  private warmingModels = new Set<string>();
-
   public async warmSession(model: string): Promise<void> {
     if (this.warmingModels.has(model)) return;
 
     if (!this.lock.tryAcquire()) return;
+    const genAtHold = this.lock.getGeneration();
 
     try {
       this.warmingModels.add(model);
@@ -512,17 +540,8 @@ export class SessionManager {
       await this.client.requestAdChain();
 
       try {
+        // Keep warm path light: create only, no extra getSession round-trip.
         const session = await this.client.createSession(model);
-        const check = await this.client.getSession(session.instance_id);
-        if (check.status === "active" && check.model && check.model !== model) {
-          console.log(`[Codebuff] Warm session model mismatch: got=${check.model} want=${model}, retrying...`);
-          await this.client.deleteSession();
-          await delay(500);
-          const retrySession = await this.client.createSession(model);
-          this.sessions.set(model, retrySession);
-          console.log(`[Codebuff] Warmed session (retry) model=${model} remaining_ms=${retrySession.remaining_ms}`);
-          return;
-        }
         this.sessions.set(model, session);
         console.log(`[Codebuff] Warmed session (created) model=${model} remaining_ms=${session.remaining_ms}`);
       } catch (err: any) {
@@ -543,7 +562,9 @@ export class SessionManager {
       console.warn(`[Codebuff] Session warm failed model=${model}`, err);
     } finally {
       this.warmingModels.delete(model);
-      this.lock.release();
+      if (this.lock.getGeneration() === genAtHold) {
+        this.lock.release();
+      }
     }
   }
 
@@ -593,15 +614,28 @@ export interface CodebuffAccountLease {
   release: () => Promise<void>;
 }
 
-const LEASE_TIMEOUT_MS = 120000; // 120s — fail fast when upstream is slow/stuck so clients don't appear hung
+// Lease watchdog: if a leased account never finishes, force-reset its session
+// manager so the token cannot stay permanently stuck.
+const LEASE_TIMEOUT_MS = 90000;
+// Fail-fast when all tokens for a model are busy. Prefer clear 429 over long hang.
+const QUEUE_TIMEOUT_MS = 8000;
+// Bound the session acquire path itself so a hung getSession/createSession cannot
+// hold the account forever while the outer request waits for CHAT_FAIL_FAST.
+const SESSION_ACQUIRE_TIMEOUT_MS = 25000;
+
+type QueueWaiter = {
+  resolve: (idx: number) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 export class CodebuffAccountPool {
   private accounts: CodebuffAccount[] = [];
   private nextIndex = 0;
-  private waitingQueue: ((idx: number) => void)[] = [];
+  private waitingQueue: QueueWaiter[] = [];
   private modelToAccounts = new Map<string, number[]>();
   private nextModelPoolIndex = new Map<string, number>();
-  private modelPoolQueues = new Map<string, ((idx: number) => void)[]>();
+  private modelPoolQueues = new Map<string, QueueWaiter[]>();
   private leaseTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
   constructor(env: CodebuffEnv) {
@@ -635,25 +669,28 @@ export class CodebuffAccountPool {
     if (modelPool && modelPool.length > 0) {
       accountIndex = await this.reserveFromModelPool(routingKey!, modelPool);
     } else {
-      accountIndex = await this.reserveAccount();
+      accountIndex = await this.reserveAccount(model);
     }
 
     const account = this.accounts[accountIndex];
     console.log(`[AccountPool] Leased account index=${accountIndex} (token=${account.client.getTokenPrefix()}) for model=${model}`);
 
-    // Watchdog: force-release if lease is held too long (stuck upstream)
+    // Watchdog: if the lease stays open too long, force-reset the session manager
+    // and free the account so later requests can recover without a process restart.
     const watchdogIdx = accountIndex;
     const timer = setTimeout(() => {
-      console.warn(`[AccountPool] LEASE TIMEOUT after ${LEASE_TIMEOUT_MS}ms — force-releasing account index=${watchdogIdx}`);
+      console.warn(`[AccountPool] LEASE TIMEOUT after ${LEASE_TIMEOUT_MS}ms — auto-recovering account index=${watchdogIdx}`);
       this.leaseTimers.delete(watchdogIdx);
-      this.releaseAccount(watchdogIdx).catch(err => {
-        console.warn(`[AccountPool] Failed to force-release account index=${watchdogIdx}`, err);
-      });
+      this.forceRecoverAccount(watchdogIdx, `lease timeout after ${LEASE_TIMEOUT_MS}ms`);
     }, LEASE_TIMEOUT_MS);
     this.leaseTimers.set(accountIndex, timer);
 
     try {
-      const { session, release: releaseSessionLock } = await account.sessions.acquireSession(model, messages);
+      const { session, release: releaseSessionLock } = await this.withTimeout(
+        account.sessions.acquireSession(model, messages),
+        SESSION_ACQUIRE_TIMEOUT_MS,
+        `Session acquire timeout after ${SESSION_ACQUIRE_TIMEOUT_MS / 1000}s for model=${model} account=${accountIndex}`
+      );
       let closed = false;
       return {
         client: account.client,
@@ -672,12 +709,48 @@ export class CodebuffAccountPool {
     } catch (err) {
       const t = this.leaseTimers.get(accountIndex);
       if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
-      await this.releaseAccount(accountIndex);
+      // Auto-recover stuck session state when acquire itself timed out.
+      if (String(err).includes("Session acquire timeout")) {
+        this.forceRecoverAccount(accountIndex, "session acquire timeout");
+      } else {
+        await this.releaseAccount(accountIndex);
+      }
       throw err;
     }
   }
 
-  private async reserveAccount(): Promise<number> {
+  private withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new CodebuffError(message, 504)), ms);
+      promise.then(
+        value => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        err => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
+    });
+  }
+
+  private forceRecoverAccount(index: number, reason: string): void {
+    const account = this.accounts[index];
+    if (!account) return;
+    console.warn(`[AccountPool] Auto-recover account index=${index} token=${account.client.getTokenPrefix()} reason=${reason}`);
+    try {
+      account.sessions.forceReset(reason);
+    } catch (err) {
+      console.warn(`[AccountPool] forceReset failed account index=${index}`, err);
+    }
+    // Free the account for future waiters even if the original holder is still mid-flight.
+    this.releaseAccount(index).catch(err => {
+      console.warn(`[AccountPool] release after recover failed account index=${index}`, err);
+    });
+  }
+
+  private async reserveAccount(model: string): Promise<number> {
     const index = this.nextAvailableIndex();
     if (index !== null) {
       this.accounts[index].busy = true;
@@ -685,9 +758,7 @@ export class CodebuffAccountPool {
       return index;
     }
 
-    return new Promise<number>(resolve => {
-      this.waitingQueue.push(resolve);
-    });
+    return this.enqueueWaiter(this.waitingQueue, model, "global");
   }
 
   private assignModelPools(): void {
@@ -701,23 +772,19 @@ export class CodebuffAccountPool {
 
     console.log(`[AccountPool] Pre-assigning priority model pools across ${count} accounts:`);
 
-    // Kisworo's priority allocation for 14 Freebuff tokens:
-    // v4-pro gets 7 tokens, v4-flash gets 2, Mimo Pro gets 4 dedicated, then 1 shared low-priority token.
-    assign("deepseek/deepseek-v4-pro", this.range(0, 7));
+    // Kisworo's priority allocation for 16 Freebuff tokens.
+    // Gemini wrappers removed — flash no longer shares capacity with Gemini models.
+    // Token counts unchanged: pro=8, flash=2, mimo-pro=4, shared low-priority=1, idle=1.
+    assign("deepseek/deepseek-v4-pro", [...this.range(0, 7), 15]);
     assign("deepseek/deepseek-v4-flash", this.range(7, 2));
     assign("mimo/mimo-v2.5-pro", this.range(9, 4));
 
     const minimaxPool = this.range(13, 1);
     assign("minimax/minimax-m2.7", minimaxPool);
     assign("minimax/minimax-m3", minimaxPool);
-
-    // Wrapper/low-priority models are pinned to an existing pool instead of
-    // borrowing random tokens. This preserves strict routing semantics.
-    assign("google/gemini-2.5-flash-lite", this.modelToAccounts.get("deepseek/deepseek-v4-flash") || []);
-    assign("google/gemini-3.1-flash-lite-preview", this.modelToAccounts.get("deepseek/deepseek-v4-flash") || []);
     assign("moonshotai/kimi-k2.6", minimaxPool);
     assign("mimo/mimo-v2.5", minimaxPool);
-    assign("google/gemini-3.1-pro-preview", minimaxPool);
+    // account index 14 intentionally left unassigned (idle spare)
   }
 
   private range(start: number, length: number): number[] {
@@ -736,22 +803,44 @@ export class CodebuffAccountPool {
       }
     }
 
-    // All accounts in this pool are busy — join the model-specific queue
-    return new Promise<number>(resolve => {
-      let queue = this.modelPoolQueues.get(model);
-      if (!queue) {
-        queue = [];
-        this.modelPoolQueues.set(model, queue);
-      }
-      queue.push(resolve);
+    // All accounts in this pool are busy — fail fast after QUEUE_TIMEOUT_MS.
+    let queue = this.modelPoolQueues.get(model);
+    if (!queue) {
+      queue = [];
+      this.modelPoolQueues.set(model, queue);
+    }
+    return this.enqueueWaiter(queue, model, "model-pool");
+  }
+
+  private enqueueWaiter(queue: QueueWaiter[], model: string, scope: string): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      const waiter: QueueWaiter = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const idx = queue.indexOf(waiter);
+          if (idx >= 0) queue.splice(idx, 1);
+          console.warn(`[AccountPool] QUEUE TIMEOUT after ${QUEUE_TIMEOUT_MS}ms model=${model} scope=${scope}`);
+          reject(new CodebuffError(
+            `Model account busy for ${model} — all assigned tokens in use (queue timeout ${QUEUE_TIMEOUT_MS / 1000}s, strict sticky routing)`,
+            429
+          ));
+        }, QUEUE_TIMEOUT_MS),
+      };
+      queue.push(waiter);
     });
+  }
+
+  private handOffToWaiter(waiter: QueueWaiter, index: number): void {
+    clearTimeout(waiter.timer);
+    waiter.resolve(index);
   }
 
   private async releaseAccount(index: number): Promise<void> {
     const nextWaiter = this.waitingQueue.shift();
     if (nextWaiter) {
       // Keep account marked busy; ownership transfers directly to the waiter.
-      nextWaiter(index);
+      this.handOffToWaiter(nextWaiter, index);
       return;
     }
 
@@ -762,7 +851,7 @@ export class CodebuffAccountPool {
         if (queue && queue.length > 0) {
           const waiter = queue.shift()!;
           if (queue.length === 0) this.modelPoolQueues.delete(model);
-          waiter(index);
+          this.handOffToWaiter(waiter, index);
           return;
         }
       }
