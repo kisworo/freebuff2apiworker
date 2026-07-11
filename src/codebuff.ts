@@ -773,17 +773,19 @@ export class CodebuffAccountPool {
     console.log(`[AccountPool] Pre-assigning priority model pools across ${count} accounts:`);
 
     // Kisworo's priority allocation for 16 Freebuff tokens.
-    // Gemini wrappers removed — flash no longer shares capacity with Gemini models.
-    // Token counts unchanged: pro=8, flash=2, mimo-pro=4, shared low-priority=1, idle=1.
+    // pro=8, flash=2, kimi-k2.7-code=4 (ex-mimo-pro), shared low-priority=1, idle=1.
     assign("deepseek/deepseek-v4-pro", [...this.range(0, 7), 15]);
     assign("deepseek/deepseek-v4-flash", this.range(7, 2));
-    assign("mimo/mimo-v2.5-pro", this.range(9, 4));
+    assign("moonshotai/kimi-k2.7-code", this.range(9, 4));
 
-    const minimaxPool = this.range(13, 1);
-    assign("minimax/minimax-m2.7", minimaxPool);
-    assign("minimax/minimax-m3", minimaxPool);
-    assign("moonshotai/kimi-k2.6", minimaxPool);
-    assign("mimo/mimo-v2.5", minimaxPool);
+    // Shared low-priority Freebuff models.
+    // mimo-v2.5-pro demoted to shared; kimi-k2.7-code promoted to dedicated pool.
+    const sharedPool = this.range(13, 1);
+    assign("minimax/minimax-m3", sharedPool);
+    assign("mimo/mimo-v2.5", sharedPool);
+    assign("mimo/mimo-v2.5-pro", sharedPool);
+    assign("kwaipilot/kat-coder-pro-v2", sharedPool);
+    assign("z-ai/glm-5.2", sharedPool);
     // account index 14 intentionally left unassigned (idle spare)
   }
 

@@ -12,20 +12,17 @@ OpenAI-compatible proxy untuk Freebuff / Codebuff API, dijalankan di Cloudflare 
 
 ### Models tersedia
 
-**Freebuff Models:**
+**Freebuff Models** (source: https://freebuff.com/live, verified 2026-07-12):
 - `deepseek/deepseek-v4-flash`
 - `deepseek/deepseek-v4-pro`
-- `moonshotai/kimi-k2.6`
-- `minimax/minimax-m2.7`
+- `moonshotai/kimi-k2.7-code` (replaced deprecated `kimi-k2.6`)
 - `minimax/minimax-m3`
 - `mimo/mimo-v2.5`
 - `mimo/mimo-v2.5-pro`
+- `kwaipilot/kat-coder-pro-v2` (new)
 - `z-ai/glm-5.2`
 
-**Gemini Models (via Freebuff session):**
-- `google/gemini-2.5-flash-lite`
-- `google/gemini-3.1-flash-lite-preview`
-- `google/gemini-3.1-pro-preview`
+Removed: `moonshotai/kimi-k2.6`, `minimax/minimax-m2.7`, and mistaken Codebuff paid-mode aliases (`codebuff/*`).
 
 ## Auth
 

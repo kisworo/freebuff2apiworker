@@ -7,14 +7,16 @@ export interface FreebuffModel {
   parent_agent_id?: string;
 }
 
+// Source of truth for Freebuff free models: https://freebuff.com/live
+// Verified 2026-07-12 via live page + /api/v1/freebuff/session.
 export const FREEBUFF_MODELS: FreebuffModel[] = [
   { id: "deepseek/deepseek-v4-flash", agent_id: "base2-free-deepseek-flash", owned_by: "freebuff" },
   { id: "deepseek/deepseek-v4-pro", agent_id: "base2-free-deepseek", owned_by: "freebuff" },
-  { id: "moonshotai/kimi-k2.6", agent_id: "base2-free-kimi", owned_by: "freebuff" },
-  { id: "minimax/minimax-m2.7", agent_id: "base2-free", owned_by: "freebuff" },
+  { id: "moonshotai/kimi-k2.7-code", agent_id: "base2-free-kimi", owned_by: "moonshotai" },
   { id: "minimax/minimax-m3", agent_id: "base2-free-minimax-m3", owned_by: "minimax" },
   { id: "mimo/mimo-v2.5", agent_id: "base2-free-mimo", owned_by: "mimo" },
   { id: "mimo/mimo-v2.5-pro", agent_id: "base2-free-mimo-pro", owned_by: "mimo" },
+  { id: "kwaipilot/kat-coder-pro-v2", agent_id: "base2-free-kat-coder-pro-v2", owned_by: "kwaipilot" },
   { id: "z-ai/glm-5.2", agent_id: "base2-free-glm", owned_by: "z-ai" },
 ];
 
