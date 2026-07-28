@@ -606,6 +606,7 @@ export interface CodebuffAccount {
   client: CodebuffClient;
   sessions: SessionManager;
   busy: boolean;
+  banned?: boolean;
 }
 
 export interface CodebuffAccountLease {
@@ -660,63 +661,72 @@ export class CodebuffAccountPool {
   }
 
   public async acquireSession(model: string, messages?: any[], routingKey?: string): Promise<CodebuffAccountLease> {
-    // Strict per-model token pools: a model may round-robin only within its
-    // assigned accounts, never borrow from another model's pool. This prevents
-    // Freebuff model_locked cascades while giving hot models more capacity.
-    const modelPool = routingKey ? this.modelToAccounts.get(routingKey) : undefined;
-    let accountIndex: number;
+    const maxAttempts = Math.min(5, this.accounts.length);
+    let lastErr: any = null;
 
-    if (modelPool && modelPool.length > 0) {
-      accountIndex = await this.reserveFromModelPool(routingKey!, modelPool);
-    } else {
-      accountIndex = await this.reserveAccount(model);
-    }
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const modelPool = routingKey ? this.modelToAccounts.get(routingKey) : undefined;
+      let accountIndex: number;
 
-    const account = this.accounts[accountIndex];
-    console.log(`[AccountPool] Leased account index=${accountIndex} (token=${account.client.getTokenPrefix()}) for model=${model}`);
+      if (modelPool && modelPool.length > 0) {
+        accountIndex = await this.reserveFromModelPool(routingKey!, modelPool);
+      } else {
+        accountIndex = await this.reserveAccount(model);
+      }
 
-    // Watchdog: if the lease stays open too long, force-reset the session manager
-    // and free the account so later requests can recover without a process restart.
-    const watchdogIdx = accountIndex;
-    const timer = setTimeout(() => {
-      console.warn(`[AccountPool] LEASE TIMEOUT after ${LEASE_TIMEOUT_MS}ms — auto-recovering account index=${watchdogIdx}`);
-      this.leaseTimers.delete(watchdogIdx);
-      this.forceRecoverAccount(watchdogIdx, `lease timeout after ${LEASE_TIMEOUT_MS}ms`);
-    }, LEASE_TIMEOUT_MS);
-    this.leaseTimers.set(accountIndex, timer);
+      const account = this.accounts[accountIndex];
+      console.log(`[AccountPool] Leased account index=${accountIndex} (token=${account.client.getTokenPrefix()}) for model=${model} (attempt ${attempt + 1})`);
 
-    try {
-      const { session, release: releaseSessionLock } = await this.withTimeout(
-        account.sessions.acquireSession(model, messages),
-        SESSION_ACQUIRE_TIMEOUT_MS,
-        `Session acquire timeout after ${SESSION_ACQUIRE_TIMEOUT_MS / 1000}s for model=${model} account=${accountIndex}`
-      );
-      let closed = false;
-      return {
-        client: account.client,
-        session,
-        release: async () => {
-          if (closed) return;
-          closed = true;
-          // Clear watchdog
-          const t = this.leaseTimers.get(accountIndex);
-          if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
-          releaseSessionLock();
-          console.log(`[AccountPool] Released account index=${accountIndex} (token=${account.client.getTokenPrefix()})`);
+      const watchdogIdx = accountIndex;
+      const timer = setTimeout(() => {
+        console.warn(`[AccountPool] LEASE TIMEOUT after ${LEASE_TIMEOUT_MS}ms — auto-recovering account index=${watchdogIdx}`);
+        this.leaseTimers.delete(watchdogIdx);
+        this.forceRecoverAccount(watchdogIdx, `lease timeout after ${LEASE_TIMEOUT_MS}ms`);
+      }, LEASE_TIMEOUT_MS);
+      this.leaseTimers.set(accountIndex, timer);
+
+      try {
+        const { session, release: releaseSessionLock } = await this.withTimeout(
+          account.sessions.acquireSession(model, messages),
+          SESSION_ACQUIRE_TIMEOUT_MS,
+          `Session acquire timeout after ${SESSION_ACQUIRE_TIMEOUT_MS / 1000}s for model=${model} account=${accountIndex}`
+        );
+        let closed = false;
+        return {
+          client: account.client,
+          session,
+          release: async () => {
+            if (closed) return;
+            closed = true;
+            const t = this.leaseTimers.get(accountIndex);
+            if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
+            releaseSessionLock();
+            console.log(`[AccountPool] Released account index=${accountIndex} (token=${account.client.getTokenPrefix()})`);
+            await this.releaseAccount(accountIndex);
+          }
+        };
+      } catch (err: any) {
+        const t = this.leaseTimers.get(accountIndex);
+        if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
+
+        const errStr = String(err);
+        if (errStr.includes("banned") || (err && err.status_code === 403)) {
+          console.warn(`[AccountPool] Account index=${accountIndex} (token=${account.client.getTokenPrefix()}) is BANNED. Marking banned.`);
+          account.banned = true;
+        }
+
+        if (errStr.includes("Session acquire timeout")) {
+          this.forceRecoverAccount(accountIndex, "session acquire timeout");
+        } else {
           await this.releaseAccount(accountIndex);
         }
-      };
-    } catch (err) {
-      const t = this.leaseTimers.get(accountIndex);
-      if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
-      // Auto-recover stuck session state when acquire itself timed out.
-      if (String(err).includes("Session acquire timeout")) {
-        this.forceRecoverAccount(accountIndex, "session acquire timeout");
-      } else {
-        await this.releaseAccount(accountIndex);
+
+        lastErr = err;
+        // If banned or session failed, continue loop to try another account
       }
-      throw err;
     }
+
+    throw lastErr || new CodebuffError(`Failed to acquire session after ${maxAttempts} attempts`, 502);
   }
 
   private withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
@@ -772,21 +782,10 @@ export class CodebuffAccountPool {
 
     console.log(`[AccountPool] Pre-assigning priority model pools across ${count} accounts:`);
 
-    // Kisworo's priority allocation for 16 Freebuff tokens.
-    // pro=8, flash=2, kimi-k2.7-code=4 (ex-mimo-pro), shared low-priority=1, idle=1.
-    assign("deepseek/deepseek-v4-pro", [...this.range(0, 7), 15]);
-    assign("deepseek/deepseek-v4-flash", this.range(7, 2));
-    assign("moonshotai/kimi-k2.7-code", this.range(9, 4));
-
-    // Shared low-priority Freebuff models.
-    // mimo-v2.5-pro demoted to shared; kimi-k2.7-code promoted to dedicated pool.
-    const sharedPool = this.range(13, 1);
-    assign("minimax/minimax-m3", sharedPool);
-    assign("mimo/mimo-v2.5", sharedPool);
-    assign("mimo/mimo-v2.5-pro", sharedPool);
-    assign("kwaipilot/kat-coder-pro-v2", sharedPool);
-    assign("z-ai/glm-5.2", sharedPool);
-    // account index 14 intentionally left unassigned (idle spare)
+    // Kisworo priority: 29 Freebuff tokens, all shared across models.
+    // Both pro & flash use all 29 accounts for max session availability.
+    assign("deepseek/deepseek-v4-pro", this.range(0, 29));
+    assign("deepseek/deepseek-v4-flash", this.range(0, 29));
   }
 
   private range(start: number, length: number): number[] {
@@ -798,7 +797,7 @@ export class CodebuffAccountPool {
     for (let i = 0; i < pool.length; i++) {
       const poolOffset = (start + i) % pool.length;
       const idx = pool[poolOffset];
-      if (!this.accounts[idx].busy) {
+      if (!this.accounts[idx].busy && !this.accounts[idx].banned) {
         this.accounts[idx].busy = true;
         this.nextModelPoolIndex.set(model, (poolOffset + 1) % pool.length);
         return idx;
@@ -882,7 +881,7 @@ export class CodebuffAccountPool {
     const count = this.accounts.length;
     for (let i = 0; i < count; i++) {
       const idx = (this.nextIndex + i) % count;
-      if (!this.accounts[idx].busy) {
+      if (!this.accounts[idx].busy && !this.accounts[idx].banned) {
         return idx;
       }
     }
