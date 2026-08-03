@@ -7,7 +7,7 @@
     "enabled": true
   },
   "vars": {
-    "FREEBUFF_AD_PROVIDERS": ",",
+    "FREEBUFF_AD_PROVIDERS": "",
     "FREEBUFF_TIMEOUT": "30",
     "FREEBUFF_DEBUG": "false",
     "FREEBUFF_TIMEZONE": "Asia/Shanghai",

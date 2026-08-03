@@ -96,7 +96,12 @@ export class CodebuffClient {
     this.api_url = env.CODEBUFF_API_URL || "https://www.codebuff.com";
     this.token = token;
     this.user_agent = env.FREEBUFF_BROWSER_UA || "Bun/1.3.11";
-    this.ad_providers = (env.FREEBUFF_AD_PROVIDERS || "gravity,zeroclick")
+    // Ad chain is OPT-IN and OFF by default. Freebuff is ad-supported: firing
+    // automated /api/v1/ads requests from a datacenter IP with a fake device
+    // fingerprint (timezone/locale/OS) looks like ad fraud to their anti-abuse
+    // system and gets accounts permanently banned (403 {"status":"banned"}).
+    // Only set FREEBUFF_AD_PROVIDERS explicitly if you know what you're doing.
+    this.ad_providers = (env.FREEBUFF_AD_PROVIDERS || "")
       .split(",")
       .map(p => p.trim())
       .filter(Boolean);
@@ -104,6 +109,8 @@ export class CodebuffClient {
     if (!this.token) {
       throw new CodebuffError("FREEBUFF_TOKEN environment variable is required", 500);
     }
+
+    console.log(`[Codebuff] Ads chain: ${this.ad_providers.length > 0 ? this.ad_providers.join(",") : "DISABLED (default — recommended)"}`);
   }
 
   public getTokenPrefix(): string {
@@ -319,6 +326,9 @@ export class CodebuffClient {
   }
 
   public async requestAdChain(messages?: any[]): Promise<void> {
+    if (this.ad_providers.length === 0) {
+      return; // ads disabled — skip entirely (see constructor comment)
+    }
     for (const provider of this.ad_providers) {
       try {
         const adsData = await this.requestAds(provider, messages);
@@ -616,8 +626,10 @@ export interface CodebuffAccountLease {
 }
 
 // Lease watchdog: if a leased account never finishes, force-reset its session
-// manager so the token cannot stay permanently stuck.
-const LEASE_TIMEOUT_MS = 90000;
+// manager so the token cannot stay permanently stuck. 5min is generous enough
+// for long complex prompts (2-5min generation) while still auto-recovering
+// genuinely stuck/hung leases (see forceRecoverAccount).
+const LEASE_TIMEOUT_MS = 300000;
 // Fail-fast when all tokens for a model are busy. Prefer clear 429 over long hang.
 const QUEUE_TIMEOUT_MS = 8000;
 // Bound the session acquire path itself so a hung getSession/createSession cannot
@@ -660,7 +672,16 @@ export class CodebuffAccountPool {
     return this.accounts.length;
   }
 
-  public async acquireSession(model: string, messages?: any[], routingKey?: string): Promise<CodebuffAccountLease> {
+  public async acquireSession(
+    model: string,
+    messages?: any[],
+    routingKey?: string,
+    signal?: AbortSignal
+  ): Promise<CodebuffAccountLease> {
+    if (signal?.aborted) {
+      throw new CodebuffError("Session acquisition aborted", 504);
+    }
+
     const maxAttempts = Math.min(5, this.accounts.length);
     let lastErr: any = null;
 
@@ -669,9 +690,9 @@ export class CodebuffAccountPool {
       let accountIndex: number;
 
       if (modelPool && modelPool.length > 0) {
-        accountIndex = await this.reserveFromModelPool(routingKey!, modelPool);
+        accountIndex = await this.reserveFromModelPool(routingKey!, modelPool, signal);
       } else {
-        accountIndex = await this.reserveAccount(model);
+        accountIndex = await this.reserveAccount(model, signal);
       }
 
       const account = this.accounts[accountIndex];
@@ -685,12 +706,38 @@ export class CodebuffAccountPool {
       }, LEASE_TIMEOUT_MS);
       this.leaseTimers.set(accountIndex, timer);
 
+      // Client abort (e.g. outer fail-fast timeout): recover the account
+      // immediately instead of leaving a zombie lease busy until the watchdog
+      // fires, which previously caused stuck accounts under load.
+      let aborted = false;
+      const onAbort = () => {
+        if (aborted) return;
+        aborted = true;
+        const t = this.leaseTimers.get(accountIndex);
+        if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
+        this.forceRecoverAccount(accountIndex, "client abort");
+      };
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          throw new CodebuffError("Session acquisition aborted", 504);
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
       try {
         const { session, release: releaseSessionLock } = await this.withTimeout(
           account.sessions.acquireSession(model, messages),
           SESSION_ACQUIRE_TIMEOUT_MS,
           `Session acquire timeout after ${SESSION_ACQUIRE_TIMEOUT_MS / 1000}s for model=${model} account=${accountIndex}`
         );
+        if (aborted) {
+          // Caller gave up while the session was being created upstream; the
+          // session lock is stale (forceReset bumped the mutex generation), so
+          // just bail — the account was already recovered by onAbort.
+          releaseSessionLock();
+          throw new CodebuffError("Session acquisition aborted", 504);
+        }
         let closed = false;
         return {
           client: account.client,
@@ -698,6 +745,7 @@ export class CodebuffAccountPool {
           release: async () => {
             if (closed) return;
             closed = true;
+            signal?.removeEventListener("abort", onAbort);
             const t = this.leaseTimers.get(accountIndex);
             if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
             releaseSessionLock();
@@ -706,6 +754,7 @@ export class CodebuffAccountPool {
           }
         };
       } catch (err: any) {
+        signal?.removeEventListener("abort", onAbort);
         const t = this.leaseTimers.get(accountIndex);
         if (t) { clearTimeout(t); this.leaseTimers.delete(accountIndex); }
 
@@ -713,6 +762,11 @@ export class CodebuffAccountPool {
         if (errStr.includes("banned") || (err && err.status_code === 403)) {
           console.warn(`[AccountPool] Account index=${accountIndex} (token=${account.client.getTokenPrefix()}) is BANNED. Marking banned.`);
           account.banned = true;
+        }
+
+        if (aborted) {
+          // Already force-recovered on abort; don't double-release.
+          throw err;
         }
 
         if (errStr.includes("Session acquire timeout")) {
@@ -760,7 +814,7 @@ export class CodebuffAccountPool {
     });
   }
 
-  private async reserveAccount(model: string): Promise<number> {
+  private async reserveAccount(model: string, signal?: AbortSignal): Promise<number> {
     const index = this.nextAvailableIndex();
     if (index !== null) {
       this.accounts[index].busy = true;
@@ -768,7 +822,7 @@ export class CodebuffAccountPool {
       return index;
     }
 
-    return this.enqueueWaiter(this.waitingQueue, model, "global");
+    return this.enqueueWaiter(this.waitingQueue, model, "global", signal);
   }
 
   private assignModelPools(): void {
@@ -792,7 +846,7 @@ export class CodebuffAccountPool {
     return Array.from({ length }, (_, i) => start + i);
   }
 
-  private reserveFromModelPool(model: string, pool: number[]): number | Promise<number> {
+  private reserveFromModelPool(model: string, pool: number[], signal?: AbortSignal): number | Promise<number> {
     const start = this.nextModelPoolIndex.get(model) || 0;
     for (let i = 0; i < pool.length; i++) {
       const poolOffset = (start + i) % pool.length;
@@ -810,17 +864,32 @@ export class CodebuffAccountPool {
       queue = [];
       this.modelPoolQueues.set(model, queue);
     }
-    return this.enqueueWaiter(queue, model, "model-pool");
+    return this.enqueueWaiter(queue, model, "model-pool", signal);
   }
 
-  private enqueueWaiter(queue: QueueWaiter[], model: string, scope: string): Promise<number> {
+  private enqueueWaiter(queue: QueueWaiter[], model: string, scope: string, signal?: AbortSignal): Promise<number> {
     return new Promise<number>((resolve, reject) => {
+      const cleanup = () => signal?.removeEventListener("abort", onAbort);
+      const onAbort = () => {
+        const idx = queue.indexOf(waiter);
+        if (idx >= 0) queue.splice(idx, 1);
+        clearTimeout(waiter.timer);
+        cleanup();
+        reject(new CodebuffError("Session acquisition aborted", 504));
+      };
       const waiter: QueueWaiter = {
-        resolve,
-        reject,
+        resolve: (idx: number) => {
+          cleanup();
+          resolve(idx);
+        },
+        reject: (err: Error) => {
+          cleanup();
+          reject(err);
+        },
         timer: setTimeout(() => {
           const idx = queue.indexOf(waiter);
           if (idx >= 0) queue.splice(idx, 1);
+          cleanup();
           console.warn(`[AccountPool] QUEUE TIMEOUT after ${QUEUE_TIMEOUT_MS}ms model=${model} scope=${scope}`);
           reject(new CodebuffError(
             `Model account busy for ${model} — all assigned tokens in use (queue timeout ${QUEUE_TIMEOUT_MS / 1000}s, strict sticky routing)`,
@@ -828,6 +897,11 @@ export class CodebuffAccountPool {
           ));
         }, QUEUE_TIMEOUT_MS),
       };
+      if (signal?.aborted) {
+        reject(new CodebuffError("Session acquisition aborted", 504));
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
       queue.push(waiter);
     });
   }

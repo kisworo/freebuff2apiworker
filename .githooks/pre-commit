@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# SECRET GUARD — blocks commits that would leak Freebuff credentials.
+# Triggered by git commit (installed via `git config core.hooksPath .githooks`).
+# Never bypass unless you are absolutely sure the value is a placeholder.
+#
+# Implementation notes:
+# - No `set -e`: git diff exits 1 whenever differences exist, which would
+#   otherwise abort the script mid-way. We handle failures explicitly.
+# - No pipes into awk/while: we dump the diff to a temp file and scan it,
+#   so a failing grep can never change control flow.
+set -uo pipefail
+
+fail() {
+  echo "❌ SECRET GUARD: $1" >&2
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' "$2" | sed 's/^/   /' >&2
+  fi
+  echo "   Commit aborted. Remove the file/value from staging and retry." >&2
+  exit 1
+}
+
+# 1. Block ADDED files that look like secret stores. (Deletions/renames are
+#    fine — that's how we clean up leaks. --diff-filter=A only looks at new
+#    files, so removing .dev.vars.bak later won't trip this.)
+added=$(git diff --cached --name-only --diff-filter=A | grep -E '(^|/)(\.dev\.vars|\.env)(\.|$)' || true)
+if [ -n "$added" ]; then
+  fail "attempting to add secret file(s):" "$added"
+fi
+
+# 2. Scan the staged diff for real-looking secret values (added lines only).
+tmp=$(mktemp) || exit 1
+trap 'rm -f "$tmp"' EXIT
+git diff --cached -U0 -- . ':(exclude)README.md' > "$tmp" || true
+
+leaks=""
+while IFS= read -r line; do
+  case "$line" in
+    +++*) continue ;;   # hunk header (+++ b/file)
+    +*) ;;              # added content line
+    *) continue ;;      # context / deletion lines
+  esac
+  body="${line#+}"
+
+  # (a) NAME="value" / NAME: "value" / NAME = value (dotenv, JSON, YAML,
+  #     spaced assignments). Catches FREEBUFF_TOKEN / *_API_KEY keys with a
+  #     real-looking value (>=20 chars, e.g. the 36-char UUID tokens).
+  #     Placeholders (***, tokenN, example, demo, changeme, your_) are ignored.
+  if [[ "$body" =~ (FREEBUFF_TOKEN|FREEBUFF_API_KEY|API_KEY)[\"']?[[:space:]]*[:=][[:space:]]*[\"']?([A-Za-z0-9_.\-]{20,}) ]]; then
+    val="${BASH_REMATCH[2]}"
+    if [[ "$val" != \*\*\** ]] && [[ "$val" != *token[0-9]* ]] && [[ "$val" != *example* ]] && [[ "$val" != *changeme* ]] && [[ "$val" != *demo* ]] && [[ "$val" != *your_* ]] && [[ "$val" != *placeholder* ]]; then
+      leaks+="$body"$'\n'
+    fi
+  # (b) bare sk-... API keys (OpenAI-style) at a word boundary. The
+  #     boundary avoids matching prose words like "risk-assessment-...".
+  elif [[ "$body" =~ (^|[^A-Za-z0-9_])sk-[A-Za-z0-9]{16,} ]]; then
+    leaks+="$body"$'\n'
+  fi
+done < "$tmp"
+
+if [ -n "$leaks" ]; then
+  fail "staged changes contain what looks like a real secret:" "$leaks"
+fi
+
+echo "✅ Secret guard: no secrets found in staged changes."
+exit 0

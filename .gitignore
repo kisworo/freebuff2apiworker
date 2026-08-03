@@ -1,6 +1,9 @@
 node_modules/
-.wrangler/tmp/
-.wrangler/*.json
+.wrangler/
+dist/
 .env
 .dev.vars
+.dev.vars.bak
+backups/.dev.vars*
+.freebuff/
 *.log

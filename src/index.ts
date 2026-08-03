@@ -20,13 +20,21 @@ const app = new Hono<{ Bindings: Record<string, string> }>();
 
 const CHAT_FAIL_FAST_MS = 60000;
 
-async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+  onTimeout?: () => void
+): Promise<T> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   try {
     return await (Promise.race([
       promise,
       new Promise<T>((_, reject) => {
-        timeoutId = setTimeout(() => reject(new CodebuffError(message, 504)), ms);
+        timeoutId = setTimeout(() => {
+          onTimeout?.();
+          reject(new CodebuffError(message, 504));
+        }, ms);
       }),
     ]) as Promise<T>);
   } finally {
@@ -79,10 +87,12 @@ app.post("/v1/chat/completions", async (c) => {
     // 1. Acquire session lease from the pool (rotates keys, locks sessions, validation, ads)
     // Use session model ID for account routing; actual model ID for session creation
     const sessionModel = getSessionId(modelConfig);
+    const abortController = new AbortController();
     lease = await withTimeout(
-      accountPool.acquireSession(modelConfig.id, body.messages, sessionModel),
+      accountPool.acquireSession(modelConfig.id, body.messages, sessionModel, abortController.signal),
       CHAT_FAIL_FAST_MS,
-      `Upstream session timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
+      `Upstream session timeout after ${CHAT_FAIL_FAST_MS / 1000}s`,
+      () => abortController.abort()
     );
     const client = lease.client;
     const session = lease.session;

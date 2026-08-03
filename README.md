@@ -73,15 +73,45 @@ npx wrangler dev
 
 | Var                   | Default                                                      | Description            |
 |-----------------------|--------------------------------------------------------------|------------------------|
-| `FREEBUFF_AD_PROVIDERS` | `gravity,zeroclick`                                        | Ad providers           |
-| `FREEBUFF_TIMEOUT`    | `60`                                                         | Session queue timeout  |
-| `FREEBUFF_DEBUG`      | `true`                                                       | Debug logging          |
-| `FREEBUFF_TIMEZONE`   | `Asia/Shanghai`                                              | Fake device timezone   |
-| `FREEBUFF_LOCALE`     | `zh-CN`                                                      | Fake device locale     |
-| `FREEBUFF_OS`         | `windows`                                                    | Fake device OS         |
-| `FREEBUFF_BROWSER_UA` | Mozilla/5.0 ... Chrome/120                                   | Fake browser user-agent|
+| `FREEBUFF_AD_PROVIDERS` | *(kosong — ads disabled)*                                  | Ad providers (⚠️ jangan diisi, lihat Security) |
+| `FREEBUFF_TIMEOUT`    | `30` (produksi) / `60` (default kode)                        | Session queue timeout  |
+| `FREEBUFF_DEBUG`      | `false`                                                      | Debug logging          |
+| `FREEBUFF_TIMEZONE`   | `Asia/Shanghai`                                              | Fake device timezone (hanya dipakai kalau ads aktif) |
+| `FREEBUFF_LOCALE`     | `zh-CN`                                                      | Fake device locale (hanya dipakai kalau ads aktif) |
+| `FREEBUFF_OS`         | `windows`                                                    | Fake device OS (hanya dipakai kalau ads aktif) |
+| `FREEBUFF_BROWSER_UA` | Mozilla/5.0 ... Chrome/120                                   | Browser user-agent untuk upstream |
 | `CODEBUFF_API_URL`    | `https://www.codebuff.com`                                   | Upstream API URL       |
 | `CLIENT_ID`           | `freebuff-cli-worker`                                        | Client identifier      |
+
+## ⚠️ Security
+
+### 1. Ad chain WAJIB mati (default sudah mati)
+
+Freebuff adalah layanan gratis yang didanai iklan. Memanggil `/api/v1/ads` secara otomatis dari server (IP datacenter) dengan fingerprint device palsu adalah **pola ad fraud / click farming** dan **menyebabkan akun di-ban permanen** (`403 {"status":"banned"}`).
+
+Sejak versi ini, ad chain **default OFF** di kode dan semua env:
+
+```
+FREEBUFF_AD_PROVIDERS=   # kosong = mati (JANGAN diisi)
+```
+
+Kalau var ini di-set ke provider apapun (`gravity`, `zeroclick`, dll), kode akan memanggil endpoint ads — **jangan lakukan itu** kecuali kamu benar-benar paham risikonya.
+
+### 2. Token jangan pernah masuk git
+
+- `.dev.vars` dan `.dev.vars.bak` sudah di-`.gitignore` dan di-untrack dari git.
+- Repo punya **secret guard** (pre-commit hook) yang otomatis memblokir commit kalau ada file `.dev.vars`/`.env` atau nilai token asli yang ke-stage:
+
+```bash
+# install sekali (sudah dilakukan di repo ini)
+git config core.hooksPath .githooks
+```
+
+Kalau commit kamu keblokir padahal bukan secret, hapus file/value itu dari staging (`git restore --staged <file>`).
+
+### 3. Rotasi token
+
+Kalau token pernah bocor (misal ke-commit di history git) atau kena banned, **rotasi di https://freebuff.071129.xyz/** — token lama harus dianggap bocor permanen. Untuk beberapa akun, generate ulang dengan cara yang berbeda per akun supaya tidak di-flag sebagai satu cluster. Token baru cukup di-set lewat `wrangler secret put FREEBUFF_TOKEN` dan `.dev.vars` (local), **jangan di-commit**.
 
 ## Multi-Account / Round-Robin Pool
 

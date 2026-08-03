@@ -8,8 +8,7 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "noEmit": true,
-    "types": ["@cloudflare/workers-types"]
+    "types": ["@cloudflare/workers-types", "bun"]
   },
-  "include": ["src/**/*"],
-  "exclude": ["src/bun.ts"]
+  "include": ["src/**/*"]
 }
