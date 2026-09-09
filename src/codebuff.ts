@@ -1,5 +1,3 @@
-import { agentValidationPayload } from "./models";
-
 export class CodebuffError extends Error {
   public status_code: number;
   constructor(message: string, status_code: number = 502) {
@@ -7,6 +5,22 @@ export class CodebuffError extends Error {
     this.name = "CodebuffError";
     this.status_code = status_code;
   }
+}
+
+/** Chat-only UA. Official CLI pins llm-providers 1.0.0 on model calls. */
+export const CLI_CHAT_UA = "ai-sdk/openai-compatible/1.0.0/codebuff";
+/** Session / agent-runs / probe: plain Bun fetch default (.bun-version 1.3.14). */
+export const CLI_BUN_UA = "Bun/1.3.14";
+
+/** SDK-faithful 13-char base36 client_id (Math.random().toString(36).substring(2,15)).
+ *  One per run. Prefixed forms (sess:/run:/wf-) are fingerprintable as a proxy. */
+export function generateClientID(): string {
+  const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz";
+  const bytes = new Uint8Array(13);
+  crypto.getRandomValues(bytes);
+  let id = "";
+  for (let i = 0; i < 13; i++) id += alphabet[bytes[i] % 36];
+  return id;
 }
 
 export interface FreebuffSession {
@@ -30,12 +44,8 @@ export interface CodebuffEnv {
   CODEBUFF_API_URL: string;
   FREEBUFF_AD_PROVIDERS?: string;
   FREEBUFF_TIMEOUT?: string;
-  FREEBUFF_TIMEZONE?: string;
-  FREEBUFF_LOCALE?: string;
-  FREEBUFF_OS?: string;
-  FREEBUFF_BROWSER_UA?: string;
-  CLIENT_ID: string;
   FREEBUFF_DEBUG?: string;
+  REQUEST_JITTER_MS?: string;
 }
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -95,22 +105,18 @@ export class CodebuffClient {
     this.env = env;
     this.api_url = env.CODEBUFF_API_URL || "https://www.codebuff.com";
     this.token = token;
-    this.user_agent = env.FREEBUFF_BROWSER_UA || "Bun/1.3.11";
-    // Ad chain is OPT-IN and OFF by default. Freebuff is ad-supported: firing
-    // automated /api/v1/ads requests from a datacenter IP with a fake device
-    // fingerprint (timezone/locale/OS) looks like ad fraud to their anti-abuse
-    // system and gets accounts permanently banned (403 {"status":"banned"}).
-    // Only set FREEBUFF_AD_PROVIDERS explicitly if you know what you're doing.
-    this.ad_providers = (env.FREEBUFF_AD_PROVIDERS || "")
-      .split(",")
-      .map(p => p.trim())
-      .filter(Boolean);
+    this.user_agent = CLI_BUN_UA;
+    // Never fire /api/v1/ads from a Worker/datacenter IP. Freebuff funds free
+    // inference with ads that only first-party clients render; automated ads
+    // from CF/VPS IPs is the pattern that produces 403 {"status":"banned"}.
+    if (env.FREEBUFF_AD_PROVIDERS) {
+      console.warn("[Codebuff] FREEBUFF_AD_PROVIDERS is set but ignored — ads from a proxy IP get accounts banned");
+    }
+    this.ad_providers = [];
 
     if (!this.token) {
       throw new CodebuffError("FREEBUFF_TOKEN environment variable is required", 500);
     }
-
-    console.log(`[Codebuff] Ads chain: ${this.ad_providers.length > 0 ? this.ad_providers.join(",") : "DISABLED (default — recommended)"}`);
   }
 
   public getTokenPrefix(): string {
@@ -129,15 +135,10 @@ export class CodebuffClient {
     userAgentOverride?: string;
     extra?: Record<string, string>;
   } = {}): Record<string, string> {
-    let hostVal = "www.codebuff.com";
-    try {
-      hostVal = new URL(this.api_url).host;
-    } catch {}
+    // CLI-faithful: bun fetch on session/runs does not set Host / Connection /
+    // Accept-Encoding. Forcing those is a proxy fingerprint.
     const headers: Record<string, string> = {
       Accept: "*/*",
-      "Accept-Encoding": "gzip, deflate",
-      Connection: "keep-alive",
-      Host: hostVal,
       "User-Agent": userAgentOverride || this.user_agent,
     };
     if (requireAuth) {
@@ -202,8 +203,21 @@ export class CodebuffClient {
             errorMsg = errObj.error.message;
           } else if (errObj.message) {
             errorMsg = errObj.message;
+          } else if (typeof errObj.error === "string") {
+            errorMsg = errObj.error;
           }
-        } catch {}
+          if (errObj.status === "banned" || /banned/i.test(text)) {
+            throw new CodebuffError("Upstream account banned", 403);
+          }
+          if (response.status === 428 || errorMsg.includes("waiting_room")) {
+            throw new CodebuffError(
+              "Upstream waiting room required. Not walking the ads chain from a proxy IP (ban risk). Retry later.",
+              503
+            );
+          }
+        } catch (err) {
+          if (err instanceof CodebuffError) throw err;
+        }
         throw new CodebuffError(errorMsg, response.status);
       }
 
@@ -213,18 +227,6 @@ export class CodebuffClient {
     } catch (err: any) {
       if (err instanceof CodebuffError) throw err;
       throw new CodebuffError(`Connection error: ${err.message || err}`, 502);
-    }
-  }
-
-  public async validateAgents(): Promise<void> {
-    try {
-      await this.request("POST", "/api/agents/validate", {
-        body: agentValidationPayload(),
-        requireAuth: false,
-      });
-      console.log("[Codebuff] Agent validation completed");
-    } catch (err) {
-      console.warn("[Codebuff] Agent validation failed; continuing anyway", err);
     }
   }
 
@@ -239,6 +241,8 @@ export class CodebuffClient {
   }
 
   public async createSession(model: string): Promise<FreebuffSession> {
+    // CLI session POST is bodyless: Authorization + x-freebuff-model only.
+    // A JSON body / Content-Type here is a proxy fingerprint.
     const response = await this.request("POST", "/api/v1/freebuff/session", {
       headers: this.getHeaders({ extra: { "x-freebuff-model": model } }),
     });
@@ -298,54 +302,17 @@ export class CodebuffClient {
     return Math.max(1000, Math.min(waitMs, 5000));
   }
 
-  public async deleteSession(): Promise<void> {
-    await this.request("DELETE", "/api/v1/freebuff/session");
-    console.log("[Codebuff] Active session deleted");
-  }
-
-  public async requestAds(
-    provider: string,
-    messages?: any[]
-  ): Promise<any> {
-    const body = {
-      provider,
-      messages: this.adMessages(messages),
-      sessionId: crypto.randomUUID(),
-      device: {
-        os: this.env.FREEBUFF_OS || "windows",
-        timezone: this.env.FREEBUFF_TIMEZONE || "Asia/Shanghai",
-        locale: this.env.FREEBUFF_LOCALE || "zh-CN",
-      },
-      userAgent: this.user_agent,
-    };
-
-    return this.request("POST", "/api/v1/ads", {
-      body,
-      userAgentOverride: "Freebuff-CLI/0.0.95",
+  public async deleteSession(instanceId?: string): Promise<void> {
+    const extra: Record<string, string> = {};
+    if (instanceId) extra["x-freebuff-instance-id"] = instanceId;
+    await this.request("DELETE", "/api/v1/freebuff/session", {
+      headers: this.getHeaders({ extra }),
     });
+    console.log(`[Codebuff] Active session deleted instance_id=${instanceId || "none"}`);
   }
 
-  public async requestAdChain(messages?: any[]): Promise<void> {
-    if (this.ad_providers.length === 0) {
-      return; // ads disabled — skip entirely (see constructor comment)
-    }
-    for (const provider of this.ad_providers) {
-      try {
-        const adsData = await this.requestAds(provider, messages);
-        const ads = adsData.ads || [];
-        const ad = ads[0] || null;
-        console.log(`[Codebuff] Ads provider=${provider} count=${ads.length} selected=${ad ? "yes" : "no"}`);
-      } catch (err) {
-        console.warn(`[Codebuff] Ads request failed for provider=${provider}`, err);
-      }
-    }
-  }
-
-  private adMessages(messages?: any[]): any[] {
-    if (!messages || messages.length === 0) {
-      return [{ role: "user", content: "ping" }];
-    }
-    return messages.slice(-3);
+  public async requestAdChain(_messages?: any[]): Promise<void> {
+    return;
   }
 
   // Run management
@@ -355,55 +322,78 @@ export class CodebuffClient {
       agentId,
       ancestorRunIds: ancestorRunIds || [],
     };
-    const data = await this.request("POST", "/api/v1/agent-runs", { body });
+    const data = await this.request("POST", "/api/v1/agent-runs", {
+      body,
+      headers: this.getHeaders({
+        jsonBody: true,
+        extra: { "x-codebuff-api-key": this.token },
+      }),
+    });
     if (!data.runId) {
       throw new CodebuffError(`Failed to start run, no runId returned: ${JSON.stringify(data)}`, 502);
     }
     return data.runId;
   }
 
-  public async recordRunStep(
+  public async finishRun(
     runId: string,
     {
-      stepNumber,
-      childRunIds = [],
+      status = "completed",
+      totalSteps = 1,
+      startedAt,
       messageId = null,
-      startTime,
+      errorMessage,
     }: {
-      stepNumber: number;
-      childRunIds?: string[];
+      status?: string;
+      totalSteps?: number;
+      startedAt: string;
       messageId?: string | null;
-      startTime: string;
+      errorMessage?: string;
     }
   ): Promise<void> {
-    const body = {
-      stepNumber,
-      credits: 0,
-      childRunIds,
-      messageId,
-      status: "completed",
-      startTime,
-    };
-    await this.request("POST", `/api/v1/agent-runs/${runId}/steps`, { body });
-  }
-
-  public async finishRun(runId: string, totalSteps: number): Promise<void> {
-    const body = {
+    // CLI has no /steps endpoint — completed steps ride on FINISH.
+    const payload: any = {
       action: "FINISH",
       runId,
-      status: "completed",
+      status,
       totalSteps,
       directCredits: 0,
       totalCredits: 0,
+      steps: [
+        {
+          id: crypto.randomUUID(),
+          stepNumber: 1,
+          credits: 0,
+          childRunIds: [],
+          messageId,
+          status: status === "completed" ? "completed" : "failed",
+          startTime: startedAt,
+        },
+      ],
     };
-    await this.request("POST", "/api/v1/agent-runs", { body });
+    if (errorMessage) {
+      payload.errorMessage = errorMessage.slice(0, 5000);
+    }
+    await this.request("POST", "/api/v1/agent-runs", {
+      body: payload,
+      headers: this.getHeaders({
+        jsonBody: true,
+        extra: { "x-codebuff-api-key": this.token },
+      }),
+    });
   }
 
   public async chatEventsStream(payload: any): Promise<Response> {
+    const jitterMs = parseInt(this.env.REQUEST_JITTER_MS || "200", 10);
+    if (jitterMs > 0) {
+      await delay(Math.floor(Math.random() * jitterMs));
+    }
+
     const url = `${this.api_url}/api/v1/chat/completions`;
     const reqHeaders = this.getHeaders({
       jsonBody: true,
-      userAgentOverride: "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.20 runtime/browser",
+      userAgentOverride: CLI_CHAT_UA,
+      extra: { Accept: "application/json, text/event-stream" },
     });
 
     if (this.env.FREEBUFF_DEBUG === "true") {
@@ -498,10 +488,8 @@ export class SessionManager {
       return activeSession;
     }
 
-    await this.client.requestAdChain(messages);
-
     try {
-      const session = await this.client.createSession(model);
+      const session = await this.rejectIfSubstituted(model, await this.client.createSession(model));
       this.sessions.set(model, session);
       console.log(`[Codebuff] Created session model=${model} instance_id=${session.instance_id} remaining_ms=${session.remaining_ms}`);
       return session;
@@ -510,14 +498,28 @@ export class SessionManager {
         throw err;
       }
       console.log(`[Codebuff] Session locked during create; delete and retry model=${model}`);
-      await this.client.deleteSession();
+      const locked = this.sessions.get(model);
+      await this.client.deleteSession(locked?.instance_id);
       this.sessions.clear();
       await delay(500);
-      await this.client.requestAdChain(messages);
-      const session = await this.client.createSession(model);
+      const session = await this.rejectIfSubstituted(model, await this.client.createSession(model));
       this.sessions.set(model, session);
       return session;
     }
+  }
+
+  /** Limited-tier accounts get silently swapped to flash/mimo. Never chat on the substitute. */
+  private async rejectIfSubstituted(requested: string, session: FreebuffSession): Promise<FreebuffSession> {
+    if (session.model && session.model !== requested) {
+      console.warn(`[Codebuff] Session substituted requested=${requested} admitted=${session.model} — deleting`);
+      await this.client.deleteSession(session.instance_id);
+      this.sessions.clear();
+      throw new CodebuffError(
+        `Muse Spark 1.3 was not admitted. Upstream opened ${session.model} instead (this account is likely limited-tier or region-blocked).`,
+        403
+      );
+    }
+    return session;
   }
 
   private isSessionFresh(session: FreebuffSession): boolean {
@@ -547,20 +549,17 @@ export class SessionManager {
         }
       }
 
-      await this.client.requestAdChain();
-
       try {
-        // Keep warm path light: create only, no extra getSession round-trip.
         const session = await this.client.createSession(model);
         this.sessions.set(model, session);
         console.log(`[Codebuff] Warmed session (created) model=${model} remaining_ms=${session.remaining_ms}`);
       } catch (err: any) {
         if (String(err).includes("model_locked")) {
           console.log(`[Codebuff] Warm session locked; delete and retry model=${model}`);
-          await this.client.deleteSession();
+          const locked = this.sessions.get(model);
+          await this.client.deleteSession(locked?.instance_id);
           this.sessions.clear();
           await delay(500);
-          await this.client.requestAdChain();
           const session = await this.client.createSession(model);
           this.sessions.set(model, session);
           console.log(`[Codebuff] Warmed session (retry after lock) model=${model} remaining_ms=${session.remaining_ms}`);
@@ -603,7 +602,7 @@ export class SessionManager {
       }
 
       console.log(`[Codebuff] Switch session current_model=${currentModel} requested_model=${requestedModel} instance_id=${instanceId}`);
-      await this.client.deleteSession();
+      await this.client.deleteSession(instanceId);
       this.sessions.clear();
       return null;
     } catch (err) {
@@ -665,7 +664,9 @@ export class CodebuffAccountPool {
       });
     }
 
-    this.assignModelPools();
+    // No per-model token partitions. Sticky farm-shaped pools (N tokens
+    // dedicated to one model) look more like a reselling cluster than a CLI.
+    // All accounts serve every model via global round-robin.
   }
 
   public get accountCount(): number {
@@ -825,27 +826,6 @@ export class CodebuffAccountPool {
     return this.enqueueWaiter(this.waitingQueue, model, "global", signal);
   }
 
-  private assignModelPools(): void {
-    const count = this.accounts.length;
-    const assign = (model: string, indexes: number[]) => {
-      const validIndexes = indexes.filter(idx => idx >= 0 && idx < count);
-      if (validIndexes.length === 0) return;
-      this.modelToAccounts.set(model, validIndexes);
-      console.log(`  ${model} → accounts[${validIndexes.join(",")}]`);
-    };
-
-    console.log(`[AccountPool] Pre-assigning priority model pools across ${count} accounts:`);
-
-    // Kisworo priority: 29 Freebuff tokens, all shared across models.
-    // Both pro & flash use all 29 accounts for max session availability.
-    assign("deepseek/deepseek-v4-pro", this.range(0, 29));
-    assign("deepseek/deepseek-v4-flash", this.range(0, 29));
-  }
-
-  private range(start: number, length: number): number[] {
-    return Array.from({ length }, (_, i) => start + i);
-  }
-
   private reserveFromModelPool(model: string, pool: number[], signal?: AbortSignal): number | Promise<number> {
     const start = this.nextModelPoolIndex.get(model) || 0;
     for (let i = 0; i < pool.length; i++) {
@@ -892,7 +872,7 @@ export class CodebuffAccountPool {
           cleanup();
           console.warn(`[AccountPool] QUEUE TIMEOUT after ${QUEUE_TIMEOUT_MS}ms model=${model} scope=${scope}`);
           reject(new CodebuffError(
-            `Model account busy for ${model} — all assigned tokens in use (queue timeout ${QUEUE_TIMEOUT_MS / 1000}s, strict sticky routing)`,
+            `Model account busy for ${model} — all tokens in use (queue timeout ${QUEUE_TIMEOUT_MS / 1000}s)`,
             429
           ));
         }, QUEUE_TIMEOUT_MS),
@@ -933,22 +913,9 @@ export class CodebuffAccountPool {
     }
 
     this.accounts[index].busy = false;
-    // Account is idle: warm sessions for models in this account's pool
-    this.warmAccountSessions(index);
-  }
-
-  private warmAccountSessions(index: number): void {
-    const account = this.accounts[index];
-    // Warm only the first assigned model for this account to avoid
-    // session thrashing on accounts that serve multiple models.
-    for (const [model, pool] of this.modelToAccounts) {
-      if (pool.includes(index)) {
-        account.sessions.warmSession(model).catch(err =>
-          console.warn(`[AccountPool] Background warm failed model=${model} account=${index}`, err)
-        );
-        return; // One model per idle window
-      }
-    }
+    // Do not background-warm sessions. Each createSession is a Freebucks
+    // charge (one session-hour). Warming unused models burns quota and
+    // looks like farm traffic.
   }
 
   private nextAvailableIndex(): number | null {

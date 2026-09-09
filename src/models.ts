@@ -2,46 +2,75 @@ export interface FreebuffModel {
   id: string;
   agent_id: string;
   owned_by: string;
-  upstream_model_id?: string;
-  session_model_id?: string;
-  parent_agent_id?: string;
+  /** Catalog default reasoning effort. Empty = omit (upstream default). */
+  default_effort?: string;
+  /** Allowed effort rungs. Empty = pass through / ignore. */
+  efforts?: string[];
+  multimodal?: boolean;
 }
 
-// Source of truth for Freebuff free models: https://freebuff.com/live
-// Verified 2026-07-12 via live page + /api/v1/freebuff/session.
+// This worker is pinned to Muse Spark 1.3 only.
+export const DEFAULT_MODEL_ID = "meta/muse-spark-1.3-contributor";
+export const FALLBACK_MODEL_ID = DEFAULT_MODEL_ID;
+
 export const FREEBUFF_MODELS: FreebuffModel[] = [
-  { id: "deepseek/deepseek-v4-flash", agent_id: "base2-free-deepseek-flash", owned_by: "freebuff" },
-  { id: "deepseek/deepseek-v4-pro", agent_id: "base2-free-deepseek", owned_by: "freebuff" },
-  { id: "moonshotai/kimi-k2.7-code", agent_id: "base2-free-kimi", owned_by: "moonshotai" },
-  { id: "minimax/minimax-m3", agent_id: "base2-free-minimax-m3", owned_by: "minimax" },
-  { id: "mimo/mimo-v2.5", agent_id: "base2-free-mimo", owned_by: "mimo" },
-  { id: "mimo/mimo-v2.5-pro", agent_id: "base2-free-mimo-pro", owned_by: "mimo" },
-  { id: "kwaipilot/kat-coder-pro-v2", agent_id: "base2-free-kat-coder-pro-v2", owned_by: "kwaipilot" },
-  { id: "z-ai/glm-5.2", agent_id: "base2-free-glm", owned_by: "z-ai" },
+  {
+    id: "meta/muse-spark-1.3-contributor",
+    agent_id: "base3-free-muse-spark-1-3",
+    owned_by: "meta",
+    default_effort: "xhigh",
+    efforts: ["minimal", "low", "medium", "high", "xhigh"],
+  },
 ];
 
-export const CONTEXT_PRUNER_AGENT_ID = "context-pruner";
-
-// Gemini wrappers removed — not used; keeps flash/pro pools free of shared-model contention.
-export const GEMINI_FREE_MODELS: FreebuffModel[] = [];
+/** Convenience / family names → the single served row. Other models 400. */
+const MODEL_ALIASES: Record<string, string> = {
+  "muse-spark-1.3-contributor": DEFAULT_MODEL_ID,
+  "muse-spark-1.3": DEFAULT_MODEL_ID,
+  "muse-spark": DEFAULT_MODEL_ID,
+  "meta/muse-spark-1.3": DEFAULT_MODEL_ID,
+  "meta/muse-spark-1.2-contributor": DEFAULT_MODEL_ID,
+  "muse-spark-1.2-contributor": DEFAULT_MODEL_ID,
+  "muse-spark-1.2": DEFAULT_MODEL_ID,
+};
 
 export const ALL_MODELS = [...FREEBUFF_MODELS];
 
+const byId = new Map(ALL_MODELS.map(m => [m.id, m]));
+
 export function resolveModel(requested: string | null | undefined): FreebuffModel {
-  const modelName = requested || FREEBUFF_MODELS[0].id;
-  const found = ALL_MODELS.find(m => m.id === modelName);
+  const raw = (requested || DEFAULT_MODEL_ID).trim();
+  const aliased = MODEL_ALIASES[raw] || raw;
+  const found = byId.get(aliased);
   if (!found) {
-    throw new Error(`Unsupported Freebuff model: ${modelName}`);
+    throw new Error(`Unsupported Freebuff model: ${raw}`);
+  }
+  if (aliased !== raw) {
+    console.log(`[models] Alias ${raw} → ${aliased}`);
   }
   return found;
 }
 
 export function getUpstreamId(model: FreebuffModel): string {
-  return model.upstream_model_id || model.id;
+  return model.id;
 }
 
 export function getSessionId(model: FreebuffModel): string {
-  return model.session_model_id || getUpstreamId(model);
+  return model.id;
+}
+
+export function isDeepSeekModel(modelId: string): boolean {
+  return modelId.includes("deepseek-v4-flash") || modelId.includes("deepseek-v4-pro");
+}
+
+export function isMediumlessLadder(model: FreebuffModel): boolean {
+  const efforts = model.efforts || [];
+  return efforts.length >= 2 && !efforts.includes("medium");
+}
+
+export function isStrictReasoningModel(modelId: string): boolean {
+  const m = modelId.toLowerCase();
+  return m.includes("mimo") || m.includes("deepseek-v4") || m.includes("kimi");
 }
 
 export function modelsResponse() {
@@ -53,80 +82,5 @@ export function modelsResponse() {
       created: 0,
       owned_by: model.owned_by,
     })),
-  };
-}
-
-export function agentValidationPayload() {
-  const modelsByAgent: Record<string, FreebuffModel> = {};
-  const spawnableByAgent: Record<string, Set<string>> = {};
-
-  for (const model of ALL_MODELS) {
-    if (!modelsByAgent[model.agent_id]) {
-      modelsByAgent[model.agent_id] = model;
-    }
-    if (!spawnableByAgent[model.agent_id]) {
-      spawnableByAgent[model.agent_id] = new Set();
-    }
-    spawnableByAgent[model.agent_id].add(CONTEXT_PRUNER_AGENT_ID);
-
-    if (model.parent_agent_id) {
-      if (!spawnableByAgent[model.parent_agent_id]) {
-        spawnableByAgent[model.parent_agent_id] = new Set();
-      }
-      spawnableByAgent[model.parent_agent_id].add(model.agent_id);
-    }
-  }
-
-  const definitions = Object.values(modelsByAgent).map(model => {
-    const spawnable = Array.from(spawnableByAgent[model.agent_id] || []);
-    return _agentDefinition({
-      agent_id: model.agent_id,
-      model_id: getUpstreamId(model),
-      display_name: `Freebuff ${getUpstreamId(model)}`,
-      spawnable_agents: spawnable,
-    });
-  });
-
-  definitions.push(
-    _agentDefinition({
-      agent_id: CONTEXT_PRUNER_AGENT_ID,
-      model_id: FREEBUFF_MODELS[0].id,
-      display_name: "Context Pruner",
-      spawnable_agents: [],
-    })
-  );
-
-  return { agentDefinitions: definitions };
-}
-
-function _agentDefinition({
-  agent_id,
-  model_id,
-  display_name,
-  spawnable_agents,
-}: {
-  agent_id: string;
-  model_id: string;
-  display_name: string;
-  spawnable_agents: string[];
-}) {
-  return {
-    id: agent_id,
-    publisher: "codebuff",
-    model: model_id,
-    displayName: display_name,
-    spawnerPrompt: "Freebuff OpenAI-compatible orchestrator",
-    inputSchema: {
-      prompt: {
-        type: "string",
-        description: "A coding task to complete",
-      },
-      params: { type: "object", properties: {}, required: [] },
-    },
-    outputMode: "last_message",
-    includeMessageHistory: true,
-    toolNames: spawnable_agents.length > 0 ? ["spawn_agents"] : [],
-    spawnableAgents: spawnable_agents,
-    systemPrompt: "Act as a helpful coding assistant.",
   };
 }

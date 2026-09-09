@@ -10,11 +10,7 @@
     "FREEBUFF_AD_PROVIDERS": "",
     "FREEBUFF_TIMEOUT": "30",
     "FREEBUFF_DEBUG": "false",
-    "FREEBUFF_TIMEZONE": "Asia/Shanghai",
-    "FREEBUFF_LOCALE": "zh-CN",
-    "FREEBUFF_OS": "windows",
-    "FREEBUFF_BROWSER_UA": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "CODEBUFF_API_URL": "https://www.codebuff.com",
-    "CLIENT_ID": "freebuff-cli-worker"
+    "REQUEST_JITTER_MS": "200",
+    "CODEBUFF_API_URL": "https://www.codebuff.com"
   }
 }

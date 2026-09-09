@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { resolveModel, modelsResponse, getSessionId } from "./models";
-import { CodebuffAccountPool, utcNowIso, FreebuffRun, CodebuffClient, CodebuffError } from "./codebuff";
+import { CodebuffAccountPool, utcNowIso, FreebuffRun, CodebuffClient, CodebuffError, generateClientID } from "./codebuff";
 import { buildUpstreamPayload, sanitizeStreamChunk, CompletionAccumulator } from "./openai_compat";
 
 function runInBackground(c: any, fn: () => Promise<any>) {
@@ -52,8 +52,11 @@ function getPool(env: any): CodebuffAccountPool {
   return pool;
 }
 
-// Auth middleware
 app.use("*", async (c, next) => {
+  if (c.req.path === "/healthz") {
+    await next();
+    return;
+  }
   const localApiKey = c.env.FREEBUFF_API_KEY;
   if (localApiKey) {
     const authHeader = c.req.header("Authorization");
@@ -84,8 +87,7 @@ app.post("/v1/chat/completions", async (c) => {
   let lease: any = null;
 
   try {
-    // 1. Acquire session lease from the pool (rotates keys, locks sessions, validation, ads)
-    // Use session model ID for account routing; actual model ID for session creation
+    // 1. Acquire session lease from the pool (round-robin, skip banned)
     const sessionModel = getSessionId(modelConfig);
     const abortController = new AbortController();
     lease = await withTimeout(
@@ -97,21 +99,24 @@ app.post("/v1/chat/completions", async (c) => {
     const client = lease.client;
     const session = lease.session;
 
-    // 2. Start freebuff run chain
+    // 2. Start a single base3 root run. Do NOT spawn context-pruner /
+    // extra child runs — N client_ids or a fan-out run tree is refused as
+    // free_mode_run_fanout and looks like a proxy.
     const run = await withTimeout(
       startFreebuffRunChain(client, modelConfig),
       CHAT_FAIL_FAST_MS,
       `Upstream run setup timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
     );
 
-    // 3. Build upstream payload
     const traceSessionId = crypto.randomUUID();
-    const payload = buildUpstreamPayload({
+    const runClientId = generateClientID();
+    const { payload, mapper } = buildUpstreamPayload({
       body,
       instanceId: session.instance_id,
-      runId: run.chat_run_id || run.run_id,
-      clientId: c.env.CLIENT_ID || "freebuff-cli-worker",
+      runId: run.run_id,
+      clientId: runClientId,
       traceSessionId,
+      stepNumber: 1,
     });
 
     if (body.stream === true) {
@@ -140,7 +145,7 @@ app.post("/v1/chat/completions", async (c) => {
             if (data.id) {
               messageId = data.id;
             }
-            const chunk = sanitizeStreamChunk(data);
+            const chunk = sanitizeStreamChunk(data, mapper);
             if (chunk !== null) {
               await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
             }
@@ -178,7 +183,7 @@ app.post("/v1/chat/completions", async (c) => {
         `Upstream chat connection timeout after ${CHAT_FAIL_FAST_MS / 1000}s`
       );
       const reader = responseStream.body!.getReader();
-      const accumulator = new CompletionAccumulator(modelConfig.id);
+      const accumulator = new CompletionAccumulator(modelConfig.id, mapper);
       let messageId: string | null = null;
 
       try {
@@ -218,80 +223,21 @@ app.post("/v1/chat/completions", async (c) => {
 });
 
 async function startFreebuffRunChain(client: CodebuffClient, model: any): Promise<FreebuffRun> {
-  if (model.parent_agent_id) {
-    return startChildChatRunChain(client, model);
-  }
-
   const agent_id = model.agent_id;
   const started_at = utcNowIso();
   const run_id = await client.startRun(agent_id);
-  const child_started_at = utcNowIso();
-  const child_run_id = await client.startRun(
-    "context-pruner",
-    [run_id]
-  );
-  await client.recordRunStep(child_run_id, {
-    stepNumber: 1,
-    startTime: child_started_at,
-  });
-  await client.finishRun(child_run_id, 2);
-  await client.recordRunStep(run_id, {
-    stepNumber: 1,
-    childRunIds: [child_run_id],
-    startTime: started_at,
-  });
-  return {
-    run_id,
-    agent_id,
-    started_at,
-    child_run_id,
-  };
-}
-
-async function startChildChatRunChain(client: CodebuffClient, model: any): Promise<FreebuffRun> {
-  const started_at = utcNowIso();
-  const parent_run_id = await client.startRun(model.parent_agent_id);
-  const chat_started_at = utcNowIso();
-  const chat_run_id = await client.startRun(
-    model.agent_id,
-    [parent_run_id]
-  );
-  return {
-    run_id: parent_run_id,
-    agent_id: model.parent_agent_id,
-    started_at,
-    child_run_id: chat_run_id,
-    chat_run_id,
-    chat_started_at,
-  };
+  return { run_id, agent_id, started_at };
 }
 
 async function finalizeRun(client: CodebuffClient, run: FreebuffRun, messageId: string | null): Promise<void> {
   try {
     console.log(`[Codebuff] Finalizing run ID=${run.run_id} MsgID=${messageId}`);
-    if (run.chat_run_id && run.chat_run_id !== run.run_id) {
-      await client.recordRunStep(run.chat_run_id, {
-        stepNumber: 1,
-        messageId,
-        startTime: run.chat_started_at || run.started_at,
-      });
-      await client.finishRun(run.chat_run_id, 2);
-      await client.recordRunStep(run.run_id, {
-        stepNumber: 1,
-        childRunIds: [run.chat_run_id],
-        startTime: run.started_at,
-      });
-      await client.finishRun(run.run_id, 2);
-      console.log(`[Codebuff] Finalized parent/child run done run_id=${run.run_id}`);
-      return;
-    }
-
-    await client.recordRunStep(run.run_id, {
-      stepNumber: 2,
+    await client.finishRun(run.run_id, {
+      status: "completed",
+      totalSteps: 1,
+      startedAt: run.started_at,
       messageId,
-      startTime: run.started_at,
     });
-    await client.finishRun(run.run_id, 3);
     console.log(`[Codebuff] Finalized run done run_id=${run.run_id}`);
   } catch (err) {
     console.warn(`[Codebuff] Finalize run failed run_id=${run.run_id}`, err);

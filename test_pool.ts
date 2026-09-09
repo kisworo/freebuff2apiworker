@@ -24,7 +24,7 @@ Bun.serve({
       return Response.json({
         status: "active",
         instanceId: "mock-instance",
-        model: "deepseek/deepseek-v4-pro",
+        model: "meta/muse-spark-1.3-contributor",
         remainingMs: 300000,
       });
     }
@@ -39,7 +39,7 @@ const env: any = {
   FREEBUFF_AD_PROVIDERS: "", // skip ad chain
   FREEBUFF_DEBUG: "false",
   CLIENT_ID: "local-test",
-  FREEBUFF_BROWSER_UA: "Freebuff-CLI/0.0.95",
+  REQUEST_JITTER_MS: "0",
 };
 
 const pool = new CodebuffAccountPool(env);
@@ -72,7 +72,7 @@ async function main() {
   // ============ T1: abort while session acquisition is in-flight ============
   hang = true;
   const ac1 = new AbortController();
-  const p1 = pool.acquireSession("deepseek/deepseek-v4-pro", [], "deepseek/deepseek-v4-pro", ac1.signal);
+  const p1 = pool.acquireSession("meta/muse-spark-1.3-contributor", [], "meta/muse-spark-1.3-contributor", ac1.signal);
   await sleep(1500); // it has reserved the account and is polling the queued session
   ac1.abort();       // caller times out → signal aborts
   hang = false;      // let the abandoned acquisition settle so p1 can reject
@@ -85,7 +85,7 @@ async function main() {
   let busyThrow = false;
   const ac2 = new AbortController();
   const p2 = pool
-    .acquireSession("deepseek/deepseek-v4-pro", [], "deepseek/deepseek-v4-pro", ac2.signal)
+    .acquireSession("meta/muse-spark-1.3-contributor", [], "meta/muse-spark-1.3-contributor", ac2.signal)
     .catch((e: any) => {
       if (String(e?.message || e).includes("All assigned accounts busy")) busyThrow = true;
       throw e;
@@ -101,11 +101,11 @@ async function main() {
   // ============ T3: queued waiter removed from waitingQueue on abort ============
   hang = true;
   const ac3 = new AbortController();
-  const p3 = pool.acquireSession("deepseek/deepseek-v4-flash", [], "deepseek/deepseek-v4-flash", ac3.signal); // holds the only account
+  const p3 = pool.acquireSession("meta/muse-spark-1.3-contributor", [], "meta/muse-spark-1.3-contributor", ac3.signal); // holds the only account
   await sleep(1200);
 
   const ac4 = new AbortController();
-  const p4 = pool.acquireSession("deepseek/deepseek-v4-flash", [], "deepseek/deepseek-v4-flash", ac4.signal); // queues behind p3
+  const p4 = pool.acquireSession("meta/muse-spark-1.3-contributor", [], "meta/muse-spark-1.3-contributor", ac4.signal); // queues behind p3
   await sleep(800);
   ac4.abort();
   const r4 = await expectAbortReject(p4, "T3a abort queued waiter");
@@ -119,7 +119,7 @@ async function main() {
   // ============ T4: no zombie after aborts — fresh acquire resolves fast ============
   const ac5 = new AbortController();
   const t0 = Date.now();
-  const p5 = pool.acquireSession("deepseek/deepseek-v4-flash", [], "deepseek/deepseek-v4-flash", ac5.signal);
+  const p5 = pool.acquireSession("meta/muse-spark-1.3-contributor", [], "meta/muse-spark-1.3-contributor", ac5.signal);
   const t4 = await Promise.race([
     p5.then(lease => ({ kind: "resolved" as const, lease })),
     sleep(2500).then(() => ({ kind: "timeout" as const })),

@@ -2,153 +2,97 @@
 
 OpenAI-compatible proxy untuk Freebuff / Codebuff API, dijalankan di Cloudflare Workers.
 
+Wire-nya diselaraskan dengan [trefeon/freebuff-proxy](https://github.com/trefeon/freebuff-proxy) v1.8.x: envelope CLI, katalog live, base3 agent, Freebucks-aware session. Ads chain **selalu mati**.
+
 ## Endpoints
 
 | Method | Path              | Description                |
 |--------|-------------------|----------------------------|
-| GET    | `/healthz`        | Health check               |
+| GET    | `/healthz`        | Health check (no auth)     |
 | GET    | `/v1/models`      | List available models      |
 | POST   | `/v1/chat/completions` | Chat completions (OpenAI-compatible) |
 
-### Models tersedia
+### Model
 
-**Freebuff Models** (source: https://freebuff.com/live, verified 2026-07-12):
-- `deepseek/deepseek-v4-flash`
-- `deepseek/deepseek-v4-pro`
-- `moonshotai/kimi-k2.7-code` (replaced deprecated `kimi-k2.6`)
-- `minimax/minimax-m3`
-- `mimo/mimo-v2.5`
-- `mimo/mimo-v2.5-pro`
-- `kwaipilot/kat-coder-pro-v2` (new)
-- `z-ai/glm-5.2`
+Hanya **Muse Spark 1.3**:
 
-Removed: `moonshotai/kimi-k2.6`, `minimax/minimax-m2.7`, and mistaken Codebuff paid-mode aliases (`codebuff/*`).
+`meta/muse-spark-1.3-contributor` (alias: `muse-spark-1.3`, `meta/muse-spark-1.2-contributor`)
+
+Model lain → 400. Kalau upstream admit model lain (akun limited/region-blocked), request di-fail 403 dan session di-DELETE — tidak pernah chat di substitute.
 
 ## Auth
 
-Set `FREEBUFF_API_KEY` sebagai secret. Client mengirim `Authorization: Bearer <api_key>` di setiap request. Jika tidak diset, auth tidak diaktifkan.
+Set `FREEBUFF_API_KEY` sebagai secret. Client mengirim `Authorization: Bearer <api_key>` di setiap request. Jika tidak diset, auth tidak diaktifkan. `/healthz` selalu publik.
 
 ## Deploy
 
 ```bash
-# Install dependencies
 npm install
-
-# Deploy ke Cloudflare
 npx wrangler deploy
 ```
 
 ## Setting Secrets (wajib!)
 
-Dapetin token Freebuff di **https://freebuff.071129.xyz/** — login trus generate token disana.
-
-Token bisa berisi satu akun atau multi akun (dipisah koma) untuk concurrent request.
-
-Ada 2 secrets yang harus diset sebelum worker bisa dipakai:
+Token Freebuff: login di **https://freebuff.071129.xyz/** lalu generate token.
 
 ```bash
-# Token API Freebuff (satu atau multi akun, pisah dengan koma)
 echo "token1,token2,token3" | npx wrangler secret put FREEBUFF_TOKEN
-
-# API Key buat akses proxy ini (optional, untuk auth client)
 echo "sk-xxx" | npx wrangler secret put FREEBUFF_API_KEY
 ```
 
 ### Local development
 
-Buat file `.dev.vars` (sudah di-gitignore):
+Buat `.dev.vars` (gitignore):
 
 ```
 FREEBUFF_TOKEN=token1,token2,token3
 FREEBUFF_API_KEY=***
 ```
 
-Jalankan dev server:
-
 ```bash
 npx wrangler dev
+# atau: bun src/bun.ts
 ```
 
-### Vars (non-sensitive — di wrangler.json)
+### Vars (`wrangler.json`)
 
-| Var                   | Default                                                      | Description            |
-|-----------------------|--------------------------------------------------------------|------------------------|
-| `FREEBUFF_AD_PROVIDERS` | *(kosong — ads disabled)*                                  | Ad providers (⚠️ jangan diisi, lihat Security) |
-| `FREEBUFF_TIMEOUT`    | `30` (produksi) / `60` (default kode)                        | Session queue timeout  |
-| `FREEBUFF_DEBUG`      | `false`                                                      | Debug logging          |
-| `FREEBUFF_TIMEZONE`   | `Asia/Shanghai`                                              | Fake device timezone (hanya dipakai kalau ads aktif) |
-| `FREEBUFF_LOCALE`     | `zh-CN`                                                      | Fake device locale (hanya dipakai kalau ads aktif) |
-| `FREEBUFF_OS`         | `windows`                                                    | Fake device OS (hanya dipakai kalau ads aktif) |
-| `FREEBUFF_BROWSER_UA` | Mozilla/5.0 ... Chrome/120                                   | Browser user-agent untuk upstream |
-| `CODEBUFF_API_URL`    | `https://www.codebuff.com`                                   | Upstream API URL       |
-| `CLIENT_ID`           | `freebuff-cli-worker`                                        | Client identifier      |
+| Var | Default | Description |
+|-----|---------|-------------|
+| `FREEBUFF_AD_PROVIDERS` | *(kosong, diabaikan)* | Ads **tidak pernah** dipanggil dari Worker |
+| `FREEBUFF_TIMEOUT` | `30` | Session queue timeout (detik) |
+| `FREEBUFF_DEBUG` | `false` | Debug logging |
+| `REQUEST_JITTER_MS` | `200` | Jitter 0–N ms sebelum chat (anti-ban) |
+| `CODEBUFF_API_URL` | `https://www.codebuff.com` | Upstream API URL |
 
-## ⚠️ Security
+## Anti-ban (non-CLI)
 
-### 1. Ad chain WAJIB mati (default sudah mati)
+Worker ini **bukan** CLI resmi. Upstream mendeteksi proxy lewat toolset, system prompt, UA, dan `client_id`. Yang dilakukan supaya akun tidak kena `403 {"status":"banned"}` / trust-cap `third_party_client`:
 
-Freebuff adalah layanan gratis yang didanai iklan. Memanggil `/api/v1/ads` secara otomatis dari server (IP datacenter) dengan fingerprint device palsu adalah **pola ad fraud / click farming** dan **menyebabkan akun di-ban permanen** (`403 {"status":"banned"}`).
+1. **Ads chain selalu OFF.** Memanggil `/api/v1/ads` dari IP datacenter + fingerprint palsu adalah pola ad-fraud yang bikin akun di-ban permanen. `FREEBUFF_AD_PROVIDERS` diabaikan meski di-set.
+2. **System prompt kanonik.** Gate free-mode adalah prefix exact `You are Buffy, the coding agent behind Codebuff.` di position 0. Prefix lama `You are Buffy. [System Override:…]` sudah ditutup upstream.
+3. **UA per-path seperti CLI.** Chat: `ai-sdk/openai-compatible/1.0.0/codebuff`. Session/run: `Bun/1.3.14`. Bukan Chrome/120, bukan `0.0.0-test` / `runtime/browser`.
+4. **`client_id` 13-char base36 per run** (bukan `freebuff-cli-worker` / UUID). Satu id diulang untuk seluruh step run yang sama — N id di satu `run_id` = `free_mode_run_fanout`.
+5. **Root base3 saja.** Tidak spawn `context-pruner` / child run. FINISH membawa steps; tidak ada POST `/steps`.
+6. **Envelope CLI:** `cost_mode=free`, `provider.data_collection=deny`, `stop=["\"cb_easp\""]`, stream forced, metadata `freebuff_instance_id` + `run_id`. Chat POST **tidak** kirim header `x-freebuff-*` (id hanya di body).
+7. **Tools di-map ke nama signature Freebuff** (bukan di-strip). Request dengan tool asing tanpa signature tool = `foreign_toolset` → downgrade + trust cap. Nama client di-restore di response.
+8. **Tidak inject `max_tokens` / temperature** kalau client tidak kirim. Sampling params + no-tools adalah sinyal foreign client (reported, belum enforced).
+9. **Tidak background-warm session.** Setiap `POST /session` adalah charge Freebucks 1 jam. Warm = bakar kuota.
+10. **DELETE session pakai `x-freebuff-instance-id`** saat ganti model (refund sisa jam).
+11. **428 waiting room tidak diikuti ads chain.** Request gagal 503, bukan jalanin ads dari IP CF.
+12. **Jitter 0–200ms** sebelum chat.
 
-Sejak versi ini, ad chain **default OFF** di kode dan semua env:
+Sisa risiko yang **tidak bisa** dihilangkan di Cloudflare Workers: egress IP datacenter (upstream memblokir proxy/VPN/Tor). Kalau akun tetap di-flag, jalankan trefeon/freebuff-proxy di VPS residential, Worker cuma reverse-proxy.
 
-```
-FREEBUFF_AD_PROVIDERS=   # kosong = mati (JANGAN diisi)
-```
+### Token jangan masuk git
 
-Kalau var ini di-set ke provider apapun (`gravity`, `zeroclick`, dll), kode akan memanggil endpoint ads — **jangan lakukan itu** kecuali kamu benar-benar paham risikonya.
-
-### 2. Token jangan pernah masuk git
-
-- `.dev.vars` dan `.dev.vars.bak` sudah di-`.gitignore` dan di-untrack dari git.
-- Repo punya **secret guard** (pre-commit hook) yang otomatis memblokir commit kalau ada file `.dev.vars`/`.env` atau nilai token asli yang ke-stage:
+`.dev.vars` sudah di-gitignore. Secret guard:
 
 ```bash
-# install sekali (sudah dilakukan di repo ini)
 git config core.hooksPath .githooks
 ```
 
-Kalau commit kamu keblokir padahal bukan secret, hapus file/value itu dari staging (`git restore --staged <file>`).
+Kalau token bocor atau banned, rotasi di https://freebuff.071129.xyz/ lalu `wrangler secret put FREEBUFF_TOKEN`.
 
-### 3. Rotasi token
+## Multi-account pool
 
-Kalau token pernah bocor (misal ke-commit di history git) atau kena banned, **rotasi di https://freebuff.071129.xyz/** — token lama harus dianggap bocor permanen. Untuk beberapa akun, generate ulang dengan cara yang berbeda per akun supaya tidak di-flag sebagai satu cluster. Token baru cukup di-set lewat `wrangler secret put FREEBUFF_TOKEN` dan `.dev.vars` (local), **jangan di-commit**.
-
-## Multi-Account / Round-Robin Pool
-
-Worker ini mendukung **banyak akun Freebuff** dalam satu token. Caranya pisah token dengan koma:
-
-```
-FREEBUFF_TOKEN=token_akun1,token_akun2,token_akun3
-```
-
-**Cara kerjanya di kode (`CodebuffAccountPool`):**
-
-1. Token di-split berdasarkan koma → setiap token jadi satu `CodebuffClient` + `SessionManager`.
-2. Setiap request masuk, pool meminjam salah satu akun secara **round-robin** (`nextIndex`).
-3. Jika semua akun sedang sibuk, request masuk ke antrian (`waitingQueue`) dan akan dilayani pas ada akun yang selesai.
-4. Akun dilepas kembali ke pool setelah request selesai (stream atau non-stream).
-
-**Kenapa multi-akun berguna?**
-- **Rate limit handling** — beban request didistribusi ke beberapa akun.
-- **Concurrent sessions** — setiap akun bisa handle satu request aktif, jadi N akun = N request paralel maksimal.
-- **Queue fallback** — kalau semua sibuk, request antri tanpa error.
-
-### Alur request (streaming)
-
-```
-Client → POST /v1/chat/completions
-          ↓
-  Auth middleware (cek FREEBUFF_API_KEY)
-          ↓
-  Resolve model (mapping nama model → agent_id Freebuff)
-          ↓
-  acquireSession (pinjam akun dari pool, round-robin)
-          ↓
-  startRunChain (start run + context-pruner child run)
-          ↓
-  buildUpstreamPayload (map ke format Codebuff API)
-          ↓
-  chatEventsStream → pipe response → Client
-          ↓
-  finalizeRun + release akun (background via waitUntil)
-```
+`FREEBUFF_TOKEN=token1,token2,token3` — round-robin, 1 request aktif per akun, skip banned, lease watchdog 5 menit, queue timeout 8 detik. Tidak ada partisi per-model (itu kelihatan seperti farm).
