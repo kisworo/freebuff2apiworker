@@ -9,22 +9,24 @@ export interface FreebuffModel {
   multimodal?: boolean;
 }
 
-// This worker is pinned to Muse Spark 1.3 only.
-export const DEFAULT_MODEL_ID = "meta/muse-spark-1.3-contributor";
+// Pinned to GLM 5.3 Flash — Freebuff withdrew Muse Spark 1.3 from free mode and
+// Freebuff itself recommends GLM 5.3 Flash (2026-09-10). Session+run verified live.
+export const DEFAULT_MODEL_ID = "z-ai/glm-5.3-flash";
 export const FALLBACK_MODEL_ID = DEFAULT_MODEL_ID;
 
 export const FREEBUFF_MODELS: FreebuffModel[] = [
   {
-    id: "meta/muse-spark-1.3-contributor",
-    agent_id: "base3-free-muse-spark-1-3",
-    owned_by: "meta",
-    default_effort: "xhigh",
-    efforts: ["minimal", "low", "medium", "high", "xhigh"],
+    id: "z-ai/glm-5.3-flash",
+    agent_id: "base3-free-glm-5-3-flash",
+    owned_by: "z-ai",
   },
 ];
 
 /** Convenience / family names → the single served row. Other models 400. */
 const MODEL_ALIASES: Record<string, string> = {
+  "glm-5.3-flash": DEFAULT_MODEL_ID,
+  "glm": DEFAULT_MODEL_ID,
+  "z-ai/glm-5.3": DEFAULT_MODEL_ID,
   "muse-spark-1.3-contributor": DEFAULT_MODEL_ID,
   "muse-spark-1.3": DEFAULT_MODEL_ID,
   "muse-spark": DEFAULT_MODEL_ID,
