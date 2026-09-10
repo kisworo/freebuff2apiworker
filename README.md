@@ -2,7 +2,7 @@
 
 OpenAI-compatible proxy untuk Freebuff / Codebuff API.
 
-Deployment aktif: **Bun standalone di VPS** (`43.156.80.25`, systemd `freebuff2api.service`, port `7300`). Cloudflare Worker build tidak lagi jadi target utama, tapi tetap didukung.
+Deployment aktif: **Bun standalone di VPS**. Cloudflare Worker build tidak lagi jadi target utama, tapi tetap didukung.
 
 Wire-nya diselaraskan dengan [trefeon/freebuff-proxy](https://github.com/trefeon/freebuff-proxy) v1.8.x: envelope CLI, base3 agent, Freebucks-aware session. Ads chain **selalu mati**.
 
